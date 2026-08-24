@@ -1,17 +1,15 @@
 import subprocess
 import sys
 import re
-
+from pathlib import Path
 
 # -----------------------------
 # TEST FILE
 # -----------------------------
 
-test_file = (
-    r"C:\Users\SINGER\OneDrive\Desktop"
-    r"\agent_workspace\ai-agent-demo-project"
-    r"\test_calculator.py"
-)
+PROJECT_DIR = Path(__file__).resolve().parent
+
+test_file = PROJECT_DIR / "demo_project" / "test_calculator.py"
 
 
 # -----------------------------

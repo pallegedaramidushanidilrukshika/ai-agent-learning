@@ -1,7 +1,20 @@
+import os
 import subprocess
 import sys
 
-test_file = r"C:\Users\SINGER\OneDrive\Desktop\agent_workspace\ai-agent-demo-project\test_calculator.py"
+# -----------------------------
+# TEST PROJECT PATH
+# -----------------------------
+
+project_dir = os.path.join(
+    os.path.dirname(os.path.abspath(__file__)),
+    "demo_project"
+)
+
+test_file = os.path.join(
+    project_dir,
+    "test_calculator.py"
+)
 
 result = subprocess.run(
     [sys.executable, "-m", "pytest", test_file, "-v"],

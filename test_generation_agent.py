@@ -177,16 +177,23 @@ print("\n=============================")
 print("TEST: GENERATE PYTEST FILE")
 print("=============================")
 
-source_file = (
-    r"C:\Users\SINGER\OneDrive\Desktop"
-    r"\agent_workspace\ai-agent-demo-project"
-    r"\calculator.py"
+# -----------------------------
+# TEST PROJECT PATHS
+# -----------------------------
+
+project_dir = os.path.join(
+    os.path.dirname(os.path.abspath(__file__)),
+    "demo_project"
 )
 
-test_file = (
-    r"C:\Users\SINGER\OneDrive\Desktop"
-    r"\agent_workspace\ai-agent-demo-project"
-    r"\test_calculator.py"
+source_file = os.path.join(
+    project_dir,
+    "calculator.py"
+)
+
+test_file = os.path.join(
+    project_dir,
+    "test_calculator.py"
 )
 
 
