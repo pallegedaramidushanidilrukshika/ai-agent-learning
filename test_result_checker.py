@@ -1,73 +1,154 @@
 import os
 import subprocess
 import sys
+import json
+import re
 
 # -----------------------------
-# TEST PROJECT PATH
+# TARGET PROJECT
 # -----------------------------
 
-project_dir = os.path.join(
-    os.path.dirname(os.path.abspath(__file__)),
-    "demo_project"
-)
+project_dir = r"C:\Users\SINGER\OneDrive\Desktop\target-projects\nodejs-todo"
 
 test_file = os.path.join(
     project_dir,
-    "test_calculator.py"
+    "test",
+    "todo.test.js"
 )
 
+# Result file will be stored inside the learning project
+result_file = os.path.join(
+    os.path.dirname(os.path.abspath(__file__)),
+    "test_result.json"
+)
+
+# -----------------------------
+# HEADER
+# -----------------------------
+
+print("\n=============================")
+print("AI TEST RESULT CHECKER")
+print("=============================")
+
+print("\nTarget Repository:")
+print(project_dir)
+
+print("\nTest File:")
+print(test_file)
+
+# -----------------------------
+# CHECK TEST FILE
+# -----------------------------
+
+if not os.path.exists(test_file):
+    print("\nERROR: Test file does not exist.")
+
+    result_data = {
+        "status": "FAILED",
+        "return_code": 1,
+        "tests": 0,
+        "passed": 0,
+        "failed": 0,
+        "test_file": test_file,
+        "error": "Test file does not exist."
+    }
+
+    with open(result_file, "w", encoding="utf-8") as f:
+        json.dump(result_data, f, indent=4)
+
+    sys.exit(1)
+
+# -----------------------------
+# RUN NODE TESTS
+# -----------------------------
+
+print("\nRunning Node.js tests...\n")
+
 result = subprocess.run(
-    [sys.executable, "-m", "pytest", test_file, "-v"],
+    [
+        "node",
+        "--test",
+        test_file
+    ],
+    cwd=project_dir,
     capture_output=True,
     text=True
 )
 
-print("\n=============================")
-print("TEST RESULT CHECK")
+# -----------------------------
+# DISPLAY RESULTS
+# -----------------------------
+
+print("=============================")
+print("TEST EXECUTION RESULT")
 print("=============================")
 
 print("\nReturn Code:")
 print(result.returncode)
 
-print("\nPytest STDOUT:")
+print("\nTest Output:")
 print(result.stdout)
 
-print("\nPytest STDERR:")
-print(result.stderr)
+if result.stderr:
+    print("\nTest Errors:")
+    print(result.stderr)
 
-if result.returncode == 0:
-    print("\nSTATUS: ALL TESTS PASSED")
+# -----------------------------
+# EXTRACT TEST COUNTS
+# -----------------------------
+
+output = result.stdout + result.stderr
+
+tests_match = re.search(r"(?:ℹ|#)\s*tests\s+(\d+)", output)
+pass_match = re.search(r"(?:ℹ|#)\s*pass\s+(\d+)", output)
+fail_match = re.search(r"(?:ℹ|#)\s*fail\s+(\d+)", output)
+
+total_tests = int(tests_match.group(1)) if tests_match else 0
+passed_tests = int(pass_match.group(1)) if pass_match else 0
+failed_tests = int(fail_match.group(1)) if fail_match else 0
+
+# -----------------------------
+# FINAL STATUS
+# -----------------------------
+
+if result.returncode == 0 and total_tests > 0 and failed_tests == 0 and total_tests > 0 and failed_tests == 0:
+
+    status = "PASSED"
+
+    print("\n=============================")
+    print("STATUS: ALL TESTS PASSED")
+    print("=============================")
+
 else:
-    print("\nSTATUS: TESTS FAILED")
 
-    import re
+    status = "FAILED"
 
-    output = result.stdout
+    print("\n=============================")
+    print("STATUS: TESTS FAILED")
+    print("=============================")
 
-    failed_tests = re.findall(
-        r"FAILED\s+(.+?)::(test_\w+)",
-        output
-    )
+# -----------------------------
+# SAVE MACHINE-READABLE RESULT
+# -----------------------------
 
-    if failed_tests:
-        print("\n=============================")
-        print("FAILURE DETAILS")
-        print("=============================")
+result_data = {
+    "status": status,
+    "return_code": result.returncode,
+    "tests": total_tests,
+    "passed": passed_tests,
+    "failed": failed_tests,
+    "test_file": test_file
+}
 
-        for file_path, test_name in failed_tests:
-            print("\nTest Name:")
-            print(test_name)
+with open(result_file, "w", encoding="utf-8") as f:
+    json.dump(result_data, f, indent=4)
 
-            print("\nFile:")
-            print(file_path)
+print("\nTest result saved to:")
+print(result_file)
 
-        failure_lines = re.findall(
-            r"(\S+\.py):(\d+):\s*(.*)",
-            output
-        )
+# -----------------------------
+# EXIT
+# -----------------------------
 
-        for file_path, line_number, reason in failure_lines:
-            print("\nFailure Location:")
-            print(f"File: {file_path}")
-            print(f"Line: {line_number}")
-            print(f"Reason: {reason}")
+if result.returncode != 0:
+    sys.exit(result.returncode)

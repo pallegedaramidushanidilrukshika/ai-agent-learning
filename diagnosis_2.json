@@ -1,0 +1,20 @@
+{
+  "bug_title": "Selected task cannot be removed or moved to Completed Tasks",
+  "project_type": "Node.js",
+  "root_cause": "In `views/index.ejs`, the Added Task checkboxes and Remove button are enclosed inside the `<form action=\"/addtask\" method=\"POST\">` form. Using a single form with `formaction=\"/removetask\"` on the submit button causes the form submission to target `/addtask` instead of `/removetask`. As a result, the `/removetask` Express endpoint in `index.js` is never executed when removing a task.",
+  "affected_files": [
+    "views\\index.ejs"
+  ],
+  "evidence": [
+    "In `views/index.ejs`, `<form action =\"/addtask\" method=\"POST\">` starts before the new task input and ends after the Remove button, wrapping both task addition and task removal elements.",
+    "When clicking the Remove button, the form POSTs to `/addtask` rather than `/removetask`, preventing the removal and transfer logic in `index.js` (`app.post(\"/removetask\", ...)` ) from running."
+  ],
+  "proposed_fix": "Separate the form in `views/index.ejs` into two distinct forms: close the first form right after the 'Add Task' button, and wrap the 'Added Task' list and 'Remove' button inside a second form with `action=\"/removetask\" method=\"POST\"`.",
+  "verification_plan": [
+    "Start the application using `node index.js`.",
+    "Navigate to http://localhost:3000 in a web browser.",
+    "Select the checkbox next to an existing task in the 'Added Task' section (e.g., 'buy socks').",
+    "Click the 'Remove' button.",
+    "Confirm that the task is removed from 'Added Task' and displayed under 'Completed task'."
+  ]
+}

@@ -1,0 +1,15 @@
+{
+  "bug_title": "Empty task can be added",
+  "description": "The Todo application allows a user to submit the Add Task form without entering any task text. An empty task is then added to the Added Task list.",
+  "severity": "Medium",
+  "reproduction_steps": [
+    "Open the Todo application at http://localhost:3000",
+    "Leave the Add New Task input empty",
+    "Click the Add Task button",
+    "Observe the Added Task list"
+  ],
+  "actual_result": "An empty task is added to the Added Task list.",
+  "expected_result": "An empty task should not be added to the Added Task list.",
+  "application_type": "Node.js",
+  "verification_method": "Reproduce the same user action after the fix and confirm that an empty task is no longer created."
+}

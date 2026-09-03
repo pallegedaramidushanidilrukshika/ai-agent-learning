@@ -1,0 +1,16 @@
+{
+  "bug_title": "Selected task cannot be removed or moved to Completed Tasks",
+  "description": "When a user selects an existing task from the Added Task list and clicks the Remove button, the selected task is not removed from the Added Task list and is not moved to the Completed Task section.",
+  "severity": "Medium",
+  "reproduction_steps": [
+    "Open the Todo application at http://localhost:3000",
+    "Locate an existing task in the Added Task list",
+    "Select the checkbox next to the task",
+    "Click the Remove button",
+    "Observe the Added Task and Completed Task sections"
+  ],
+  "actual_result": "The selected task is not removed from the Added Task list and is not moved to the Completed Task section.",
+  "expected_result": "The selected task should be removed from the Added Task list and added to the Completed Task section.",
+  "application_type": "Node.js",
+  "verification_method": "Repeat the same user action after the fix and confirm that the selected task moves from Added Tasks to Completed Tasks."
+}

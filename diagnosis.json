@@ -1,0 +1,20 @@
+{
+  "bug_title": "Empty task can be added",
+  "project_type": "Node.js",
+  "root_cause": "The `/addtask` POST route handler in `index.js` receives `req.body.newtask` from the user form. Without proper validation and trimming on the server side (or if empty/whitespace strings bypass client-side checks), empty strings or whitespace-only inputs are allowed to be pushed into the `task` array, resulting in blank items appearing in the task list.",
+  "affected_files": [
+    "index.js",
+    "views/index.ejs"
+  ],
+  "evidence": [
+    "In `index.js`, `app.post(\"/addtask\", ...)` handles task creation via `req.body.newtask`.",
+    "In `views/index.ejs`, the form `<input type=\"text\" name=\"newtask\" placeholder=\"add new task\" required>` allows whitespace-only input to pass browser validation if spaces are entered."
+  ],
+  "proposed_fix": "Ensure server-side validation in `index.js` checks that `req.body.newtask` exists, is a string, and is non-empty after trimming whitespace before calling `task.push(newTask.trim())`. In `views/index.ejs`, optional pattern validation or trimming can also be enforced.",
+  "verification_plan": [
+    "Start the Node.js application (`node index.js`).",
+    "Open http://localhost:3000 in a browser.",
+    "Leave the task input empty or enter only spaces, then click 'Add Task'.",
+    "Confirm that no blank entry is added to the 'Added Task' list."
+  ]
+}

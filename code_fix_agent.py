@@ -1,16 +1,16 @@
+import json
 import os
+import sys
 
 from dotenv import load_dotenv
-from langchain_google_genai import ChatGoogleGenerativeAI
+from langchain_groq import ChatGroq
 from langchain.agents import create_agent
 from langchain_core.tools import tool
 
-from failure_pipeline import get_failure_info
 
-
-# -----------------------------
+# ---------------------------------------------------------
 # LOAD ENVIRONMENT VARIABLES
-# -----------------------------
+# ---------------------------------------------------------
 
 load_dotenv()
 
@@ -20,54 +20,92 @@ if not api_key:
     raise ValueError("GEMINI_API_KEY was not found.")
 
 
-# -----------------------------
-# CREATE GEMINI MODEL
-# -----------------------------
+# ---------------------------------------------------------
+# PATHS
+# ---------------------------------------------------------
 
-llm = ChatGoogleGenerativeAI(
-    model="gemini-3.5-flash",
+TARGET_REPOSITORY = os.path.abspath(
+    r"C:\Users\SINGER\OneDrive\Desktop\target-projects\nodejs-todo"
+)
+
+if len(sys.argv) > 1:
+    DIAGNOSIS_FILE = sys.argv[1]
+else:
+    DIAGNOSIS_FILE = "diagnosis.json"
+
+
+# ---------------------------------------------------------
+# LOAD AI DIAGNOSIS
+# ---------------------------------------------------------
+
+with open(DIAGNOSIS_FILE, "r", encoding="utf-8") as f:
+    diagnosis = json.load(f)
+
+
+# ---------------------------------------------------------
+# CREATE GEMINI MODEL
+# ---------------------------------------------------------
+
+llm = ChatGroq(
+    model="openai/gpt-oss-20b",
     temperature=0
 )
 
 
-# -----------------------------
+# ---------------------------------------------------------
 # TOOL: READ FILE
-# -----------------------------
+# ---------------------------------------------------------
 
 @tool
 def read_file(file_path: str) -> str:
     """
-    Read the contents of a Python file.
+    Read a source file from the target repository.
     """
 
-    try:
-        if not os.path.exists(file_path):
-            return f"File does not exist: {file_path}"
+    full_path = os.path.abspath(
+        os.path.join(TARGET_REPOSITORY, file_path)
+    )
 
+    # Security: prevent access outside target repository
+    if not full_path.startswith(TARGET_REPOSITORY):
+        return "Error: Access outside target repository is not allowed."
+
+    if not os.path.exists(full_path):
+        return f"File does not exist: {file_path}"
+
+    try:
         with open(
-            file_path,
+            full_path,
             "r",
             encoding="utf-8"
         ) as file:
             return file.read()
 
-    except Exception as e:
-        return f"File reading error: {e}"
+    except Exception as error:
+        return f"File reading error: {error}"
 
 
-# -----------------------------
+# ---------------------------------------------------------
 # TOOL: WRITE FILE
-# -----------------------------
+# ---------------------------------------------------------
 
 @tool
 def write_file(file_path: str, content: str) -> str:
     """
-    Write updated contents to a Python file.
+    Write corrected source code to a file in the target repository.
     """
+
+    full_path = os.path.abspath(
+        os.path.join(TARGET_REPOSITORY, file_path)
+    )
+
+    # Security: prevent writing outside target repository
+    if not full_path.startswith(TARGET_REPOSITORY):
+        return "Error: Writing outside target repository is not allowed."
 
     try:
         with open(
-            file_path,
+            full_path,
             "w",
             encoding="utf-8"
         ) as file:
@@ -75,13 +113,13 @@ def write_file(file_path: str, content: str) -> str:
 
         return f"File successfully updated: {file_path}"
 
-    except Exception as e:
-        return f"File writing error: {e}"
+    except Exception as error:
+        return f"File writing error: {error}"
 
 
-# -----------------------------
+# ---------------------------------------------------------
 # CREATE CODE FIX AGENT
-# -----------------------------
+# ---------------------------------------------------------
 
 agent = create_agent(
     model=llm,
@@ -92,65 +130,69 @@ agent = create_agent(
     ],
 
     system_prompt="""
-You are a Python Code Fix Agent.
+You are an AI Software Code Fix Agent.
 
-Your job is to fix a failed pytest test.
+Your job is to fix a REAL application bug based on an
+AI-generated diagnosis.
 
-You have access to two tools:
+IMPORTANT:
 
-1. read_file
-   Use this to read the current contents of the relevant Python file.
+- The target application can use any programming language
+  or framework.
+- Do NOT assume the project is Python.
+- Do NOT create pytest tests.
+- Do NOT create new unit tests unless explicitly requested.
+- Fix the actual application source code.
+- Make the minimum necessary changes.
+- Preserve existing functionality.
+- Do not modify unrelated files.
+- Read the affected source files before modifying them.
+- Actually use the write_file tool to save the fix.
+- Do not only describe the fix.
+- After modifying the files, explain exactly what changed.
 
-2. write_file
-   Use this to write the corrected contents back to the file.
+WORKFLOW:
 
-Workflow:
+1. Read the diagnosis provided by the user.
+2. Identify the affected files.
+3. Read each affected file using read_file.
+4. Understand the existing implementation.
+5. Identify the exact code responsible for the bug.
+6. Apply the smallest safe fix.
+7. Use write_file to save the corrected source code.
+8. Report:
+   - root cause
+   - files modified
+   - exact changes made
+   - how the fix should be verified
 
-1. Identify the failed test.
-2. Identify the test file and line number.
-3. Read the relevant file using read_file.
-4. Understand the failure.
-5. Determine the appropriate code change.
-6. Modify ONLY what is necessary to fix the failure.
-7. Use write_file to save the corrected file.
-8. Clearly explain what was changed.
+IMPORTANT SAFETY RULE:
 
-Important rules:
+Only modify files inside the target repository.
 
-- Do not make unnecessary changes.
-- Preserve the existing code structure.
-- Do not delete working tests.
-- Do not change unrelated functionality.
-- Actually modify the file using write_file.
-- After modifying the file, report the exact change made.
+Do not change:
+- .git
+- node_modules
+- package-lock.json
+- unrelated files
 """
 )
 
 
-# -----------------------------
-# GET FAILURE INFORMATION
-# -----------------------------
-
-failure_info = get_failure_info()
-
-if failure_info is None:
-    print("\nNo test failures found.")
-    exit()
-
-
-failed_test = failure_info["failed_test"]
-test_file = failure_info["file_path"]
-line_number = failure_info["line_number"]
-failure_reason = failure_info["reason"]
-
-
-# -----------------------------
+# ---------------------------------------------------------
 # RUN CODE FIX AGENT
-# -----------------------------
+# ---------------------------------------------------------
 
 print("\n=============================")
-print("CODE FIX AGENT")
+print("AI CODE FIX AGENT")
 print("=============================")
+
+print("\nTarget Repository:")
+print(TARGET_REPOSITORY)
+
+print("\nDiagnosis:")
+print(json.dumps(diagnosis, indent=2))
+
 
 result = agent.invoke(
     {
@@ -158,33 +200,29 @@ result = agent.invoke(
             {
                 "role": "user",
                 "content": f"""
-Fix the following pytest failure.
+Fix the following real application bug.
 
-Failed Test:
-{failed_test}
+TARGET REPOSITORY:
+{TARGET_REPOSITORY}
 
-Test File:
-{test_file}
-
-Line Number:
-{line_number}
-
-Failure Reason:
-{failure_reason}
+AI DIAGNOSIS:
+{json.dumps(diagnosis, indent=2)}
 
 Instructions:
 
-1. Read the test file using the read_file tool.
-2. Find the failed test.
-3. Understand why it failed.
-4. Make the minimum necessary change to fix it.
-5. Use write_file to save the corrected file.
-6. Do not modify unrelated tests or functionality.
+1. Read every file listed in "affected_files".
+2. Understand the current implementation.
+3. Implement the proposed fix.
+4. Modify only the affected source files.
+5. Preserve all unrelated functionality.
+6. Use the write_file tool to actually save the changes.
+7. Do not create tests.
+8. Do not modify package-lock.json.
+9. Do not modify node_modules.
+10. After fixing, explain exactly what was changed.
 
-After fixing the file, explain:
-- What caused the failure.
-- What change you made.
-- Which file was modified.
+This is a real application bug-fixing task.
+The goal is to modify the actual application source code.
 """
             }
         ]
@@ -192,9 +230,9 @@ After fixing the file, explain:
 )
 
 
-# -----------------------------
-# PRINT AGENT RESULT
-# -----------------------------
+# ---------------------------------------------------------
+# PRINT RESULT
+# ---------------------------------------------------------
 
 print("\n=============================")
 print("CODE FIX RESULT")
