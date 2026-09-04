@@ -1,10 +1,7 @@
-from ast import arguments
 import os
 import sys
 import subprocess
 import json
-
-from click import command
 from datetime import datetime
 
 
@@ -16,14 +13,27 @@ BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 
 TARGET_REPOSITORY = r"C:\Users\SINGER\OneDrive\Desktop\target-projects\nodejs-todo"
 
-BUG_REPORT_FILE = os.path.join(BASE_DIR, "diagnosis.json")
-BUG_REPORT_FILE_2 = os.path.join(BASE_DIR, "diagnosis_2.json")
+# Maximum number of re-fix/re-test attempts after the initial attempt
+MAX_RETRIES = 2
 
+# Initial diagnosis files
+BUG_REPORT_FILE = os.path.join(
+    BASE_DIR,
+    "diagnosis.json"
+)
+
+BUG_REPORT_FILE_2 = os.path.join(
+    BASE_DIR,
+    "diagnosis_2.json"
+)
+
+# Repository context
 REPOSITORY_CONTEXT_FILE = os.path.join(
     BASE_DIR,
     "repository_context.json"
 )
 
+# Test and verification outputs
 TEST_RESULT_FILE = os.path.join(
     BASE_DIR,
     "test_result.json"
@@ -34,11 +44,13 @@ VERIFICATION_REPORT_FILE = os.path.join(
     "verification_report.json"
 )
 
+# Final workflow report
 WORKFLOW_REPORT_FILE = os.path.join(
     BASE_DIR,
     "workflow_report.json"
 )
 
+# Target test file
 TARGET_TEST_FILE = os.path.join(
     TARGET_REPOSITORY,
     "test",
@@ -65,6 +77,7 @@ AGENTS = {
 # ============================================================
 
 def print_header(title):
+
     print("\n")
     print("=" * 70)
     print(title)
@@ -72,10 +85,19 @@ def print_header(title):
 
 
 def print_stage(number, name):
+
     print("\n")
     print("-" * 70)
     print(f"STAGE {number}: {name}")
     print("-" * 70)
+
+
+def print_attempt(attempt):
+
+    print("\n")
+    print("#" * 70)
+    print(f"DEBUGGING ATTEMPT {attempt}")
+    print("#" * 70)
 
 
 # ============================================================
@@ -83,12 +105,6 @@ def print_stage(number, name):
 # ============================================================
 
 def is_quota_error(output):
-    """
-    Detect Gemini/API quota errors from agent output.
-
-    We do not treat every agent failure as a quota failure.
-    Only known quota/rate-limit indicators are accepted.
-    """
 
     if not output:
         return False
@@ -108,7 +124,10 @@ def is_quota_error(output):
         "free tier",
     ]
 
-    return any(keyword in text for keyword in quota_keywords)
+    return any(
+        keyword in text
+        for keyword in quota_keywords
+    )
 
 
 # ============================================================
@@ -116,39 +135,45 @@ def is_quota_error(output):
 # ============================================================
 
 def run_agent(script_name, arguments=None):
-    """
-    Execute an agent and return detailed execution information.
 
-    Returns:
-        {
-            "success": True/False,
-            "quota_error": True/False,
-            "return_code": int,
-            "output": str
-        }
-    """
-
-    script_path = os.path.join(BASE_DIR, script_name)
+    script_path = os.path.join(
+        BASE_DIR,
+        script_name
+    )
 
     if not os.path.exists(script_path):
-        print(f"ERROR: Agent file not found: {script_name}")
+
+        print(
+            f"ERROR: Agent file not found: "
+            f"{script_name}"
+        )
 
         return {
             "success": False,
             "quota_error": False,
             "return_code": -1,
-            "output": f"Agent file not found: {script_name}"
+            "output":
+                f"Agent file not found: {script_name}"
         }
 
-    print(f"\nRunning agent: {script_name}")
+    print(
+        f"\nRunning agent: {script_name}"
+    )
+
     print("-" * 70)
 
     try:
 
-        command = [sys.executable, script_path]
+        command = [
+            sys.executable,
+            script_path
+        ]
 
         if arguments:
-            command.extend(arguments)
+
+            command.extend(
+                arguments
+            )
 
         result = subprocess.run(
             command,
@@ -160,46 +185,64 @@ def run_agent(script_name, arguments=None):
         output = ""
 
         if result.stdout:
+
             output += result.stdout
 
         if result.stderr:
+
             output += "\n" + result.stderr
 
-        # Print agent output to terminal
         if output:
+
             print(output)
 
-        quota_error = is_quota_error(output)
+        quota_error = is_quota_error(
+            output
+        )
 
         if result.returncode == 0:
 
-            print(f"\nCOMPLETED: {script_name}")
+            print(
+                f"\nCOMPLETED: {script_name}"
+            )
 
             return {
                 "success": True,
                 "quota_error": False,
-                "return_code": result.returncode,
+                "return_code":
+                    result.returncode,
                 "output": output
             }
 
         if quota_error:
 
-            print(f"\nQUOTA ERROR DETECTED: {script_name}")
+            print(
+                f"\nQUOTA ERROR DETECTED: "
+                f"{script_name}"
+            )
 
             return {
                 "success": False,
                 "quota_error": True,
-                "return_code": result.returncode,
+                "return_code":
+                    result.returncode,
                 "output": output
             }
 
-        print(f"\nFAILED: {script_name}")
-        print(f"Return code: {result.returncode}")
+        print(
+            f"\nFAILED: {script_name}"
+        )
+
+        print(
+            f"Return code: "
+            f"{result.returncode}"
+        )
 
         return {
             "success": False,
             "quota_error": False,
-            "return_code": result.returncode,
+            "return_code":
+                result.returncode,
             "output": output
         }
 
@@ -207,11 +250,18 @@ def run_agent(script_name, arguments=None):
 
         error_text = str(e)
 
-        print(f"\nERROR running {script_name}: {error_text}")
+        print(
+            f"\nERROR running "
+            f"{script_name}: "
+            f"{error_text}"
+        )
 
         return {
             "success": False,
-            "quota_error": is_quota_error(error_text),
+            "quota_error":
+                is_quota_error(
+                    error_text
+                ),
             "return_code": -1,
             "output": error_text
         }
@@ -222,17 +272,31 @@ def run_agent(script_name, arguments=None):
 # ============================================================
 
 def file_exists(path):
+
     return os.path.exists(path)
 
 
 def check_file(filename):
-    path = os.path.join(BASE_DIR, filename)
+
+    path = os.path.join(
+        BASE_DIR,
+        filename
+    )
 
     if os.path.exists(path):
-        print(f"Output created: {filename}")
+
+        print(
+            f"Output created: "
+            f"{filename}"
+        )
+
         return True
 
-    print(f"WARNING: Expected output not found: {filename}")
+    print(
+        f"WARNING: Expected output "
+        f"not found: {filename}"
+    )
+
     return False
 
 
@@ -241,18 +305,15 @@ def check_file(filename):
 # ============================================================
 
 def has_source_changes():
-    """
-    Check whether the target repository contains source changes
-    compared with its current Git HEAD.
-
-    This is used only as evidence that an existing fix is present.
-    It does NOT create or fake a fix.
-    """
 
     try:
 
         result = subprocess.run(
-            ["git", "status", "--short"],
+            [
+                "git",
+                "status",
+                "--short"
+            ],
             cwd=TARGET_REPOSITORY,
             text=True,
             capture_output=True
@@ -261,16 +322,25 @@ def has_source_changes():
         output = result.stdout.strip()
 
         if not output:
+
             return False
 
-        print("\nExisting target repository changes detected:")
+        print(
+            "\nExisting target repository "
+            "changes detected:"
+        )
+
         print(output)
 
         return True
 
     except Exception as e:
 
-        print(f"Could not inspect Git status: {e}")
+        print(
+            f"Could not inspect Git status: "
+            f"{e}"
+        )
+
         return False
 
 
@@ -280,14 +350,24 @@ def has_source_changes():
 
 def existing_tests_available():
 
-    if os.path.exists(TARGET_TEST_FILE):
+    if os.path.exists(
+        TARGET_TEST_FILE
+    ):
 
-        print("\nExisting test suite found:")
-        print(TARGET_TEST_FILE)
+        print(
+            "\nExisting test suite found:"
+        )
+
+        print(
+            TARGET_TEST_FILE
+        )
 
         return True
 
-    print("\nNo existing target test suite found.")
+    print(
+        "\nNo existing target "
+        "test suite found."
+    )
 
     return False
 
@@ -299,17 +379,29 @@ def existing_tests_available():
 def load_json(path):
 
     if not os.path.exists(path):
+
         return None
 
     try:
 
-        with open(path, "r", encoding="utf-8") as f:
+        with open(
+            path,
+            "r",
+            encoding="utf-8"
+        ) as f:
+
             return json.load(f)
 
     except Exception as e:
 
-        print(f"Could not read JSON file: {path}")
-        print(f"Reason: {e}")
+        print(
+            f"Could not read JSON file: "
+            f"{path}"
+        )
+
+        print(
+            f"Reason: {e}"
+        )
 
         return None
 
@@ -320,14 +412,22 @@ def load_json(path):
 
 def validate_test_result():
 
-    data = load_json(TEST_RESULT_FILE)
+    data = load_json(
+        TEST_RESULT_FILE
+    )
 
     if not data:
 
-        print("\nERROR: test_result.json is missing or invalid.")
+        print(
+            "\nERROR: test_result.json "
+            "is missing or invalid."
+        )
+
         return False
 
-    print("\nTest result information:")
+    print(
+        "\nTest result information:"
+    )
 
     print(
         f"Total tests: "
@@ -344,7 +444,12 @@ def validate_test_result():
         f"{data.get('failed_tests', data.get('failed', 'N/A'))}"
     )
 
-    status = str(data.get("status", "")).upper()
+    status = str(
+        data.get(
+            "status",
+            ""
+        )
+    ).upper()
 
     if status in [
         "PASS",
@@ -355,10 +460,35 @@ def validate_test_result():
 
         return True
 
-    # Some versions of the test checker may use numeric results.
-    total = data.get("total_tests")
-    passed = data.get("passed_tests")
-    failed = data.get("failed_tests")
+    total = data.get(
+        "total_tests"
+    )
+
+    passed = data.get(
+        "passed_tests"
+    )
+
+    failed = data.get(
+        "failed_tests"
+    )
+
+    if total is None:
+
+        total = data.get(
+            "tests"
+        )
+
+    if passed is None:
+
+        passed = data.get(
+            "passed"
+        )
+
+    if failed is None:
+
+        failed = data.get(
+            "failed"
+        )
 
     if (
         isinstance(total, int)
@@ -366,7 +496,11 @@ def validate_test_result():
         and isinstance(failed, int)
     ):
 
-        return total > 0 and passed == total and failed == 0
+        return (
+            total > 0
+            and passed == total
+            and failed == 0
+        )
 
     return False
 
@@ -377,27 +511,55 @@ def validate_test_result():
 
 def validate_verification():
 
-    data = load_json(VERIFICATION_REPORT_FILE)
+    data = load_json(
+        VERIFICATION_REPORT_FILE
+    )
 
     if not data:
 
-        print("\nERROR: verification_report.json is missing.")
+        print(
+            "\nERROR: "
+            "verification_report.json "
+            "is missing."
+        )
+
         return False
 
-    print("\nVerification information:")
+    print(
+        "\nVerification information:"
+    )
 
     bug_status = str(
-        data.get("bug_status", data.get("Bug Status", ""))
+        data.get(
+            "bug_status",
+            data.get(
+                "Bug Status",
+                ""
+            )
+        )
     ).upper()
 
     overall_status = str(
-        data.get("overall_status", data.get("Overall Status", ""))
+        data.get(
+            "overall_status",
+            data.get(
+                "Overall Status",
+                ""
+            )
+        )
     ).upper()
 
-    print(f"Bug Status: {bug_status}")
-    print(f"Overall Status: {overall_status}")
+    print(
+        f"Bug Status: {bug_status}"
+    )
+
+    print(
+        f"Overall Status: "
+        f"{overall_status}"
+    )
 
     if bug_status == "FIXED":
+
         return True
 
     if overall_status in [
@@ -405,6 +567,7 @@ def validate_verification():
         "PASSED",
         "SUCCESS"
     ]:
+
         return True
 
     return False
@@ -423,31 +586,125 @@ def add_stage_result(
 ):
 
     stage = {
-        "stage": stage_number,
-        "name": stage_name,
-        "status": status,
-        "timestamp": datetime.now().isoformat()
+
+        "stage":
+            stage_number,
+
+        "name":
+            stage_name,
+
+        "status":
+            status,
+
+        "timestamp":
+            datetime.now().isoformat()
     }
 
     if details:
+
         stage["details"] = details
 
-    stage_results.append(stage)
+    stage_results.append(
+        stage
+    )
 
-    print("\nStage result:")
-    print(json.dumps(stage, indent=4))
+    print(
+        "\nStage result:"
+    )
+
+    print(
+        json.dumps(
+            stage,
+            indent=4
+        )
+    )
 
 
 # ============================================================
-# WORKFLOW REPORT
+# CREATE RETRY FAILURE CONTEXT
+# ============================================================
+
+def create_retry_failure_context(
+    attempt,
+    diagnosis_file
+):
+
+    test_result = load_json(
+        TEST_RESULT_FILE
+    )
+
+    verification = load_json(
+        VERIFICATION_REPORT_FILE
+    )
+
+    context = {
+
+        "retry_attempt":
+            attempt,
+
+        "previous_diagnosis":
+            diagnosis_file,
+
+        "test_result":
+            test_result,
+
+        "verification_result":
+            verification,
+
+        "instruction":
+            (
+                "The previous code fix did not "
+                "successfully verify. Re-analyze "
+                "the repository and the previous "
+                "failure. Identify the actual root "
+                "cause and propose a corrected "
+                "minimal and safe fix."
+            )
+    }
+
+    failure_file = os.path.join(
+        BASE_DIR,
+        f"bug_report_retry_{attempt}.json"
+    )
+
+    with open(
+        failure_file,
+        "w",
+        encoding="utf-8"
+    ) as f:
+
+        json.dump(
+            context,
+            f,
+            indent=4,
+            ensure_ascii=False
+        )
+
+    print(
+        "\nRetry failure context created:"
+    )
+
+    print(
+        failure_file
+    )
+
+    return failure_file
+
+
+# ============================================================
+# CREATE WORKFLOW REPORT
 # ============================================================
 
 def create_workflow_report(
     stage_results,
-    final_status
+    final_status,
+    retry_history
 ):
 
-    test_result = load_json(TEST_RESULT_FILE)
+    test_result = load_json(
+        TEST_RESULT_FILE
+    )
+
     verification_report = load_json(
         VERIFICATION_REPORT_FILE
     )
@@ -463,8 +720,26 @@ def create_workflow_report(
         "timestamp":
             datetime.now().isoformat(),
 
+        "workflow_logic":
+            [
+                "Repository Analysis",
+                "Bug Diagnosis",
+                "Code Fix",
+                "Test Generation",
+                "Test Execution",
+                "Verification",
+                "Retry on Failure",
+                "Final Report"
+            ],
+
+        "max_retries":
+            MAX_RETRIES,
+
         "stages":
             stage_results,
+
+        "retry_history":
+            retry_history,
 
         "test_result":
             test_result,
@@ -485,16 +760,20 @@ def create_workflow_report(
         json.dump(
             report,
             f,
-            indent=4
+            indent=4,
+            ensure_ascii=False
         )
 
     print("\n")
     print("=" * 70)
-    print("WORKFLOW REPORT CREATED")
+    print(
+        "WORKFLOW REPORT CREATED"
+    )
     print("=" * 70)
 
     print(
-        f"\nReport: {WORKFLOW_REPORT_FILE}"
+        f"\nReport: "
+        f"{WORKFLOW_REPORT_FILE}"
     )
 
     return report
@@ -510,10 +789,18 @@ def main():
         "AI AGENTIC SOFTWARE DEBUGGING WORKFLOW"
     )
 
-    print("\nTarget Application:")
-    print(TARGET_REPOSITORY)
+    print(
+        "\nTarget Application:"
+    )
 
-    print("\nWorkflow:")
+    print(
+        TARGET_REPOSITORY
+    )
+
+    print(
+        "\nWorkflow:"
+    )
+
     print(
         "Repository Analysis"
         " -> Bug Diagnosis"
@@ -521,15 +808,19 @@ def main():
         " -> Test Generation"
         " -> Test Execution"
         " -> Verification"
+        " -> Retry if Failed"
         " -> Final Report"
     )
 
     stage_results = []
 
+    retry_history = []
+
     skipped_ai_stages = []
 
     workflow_failed = False
-    ACTIVE_DIAGNOSIS_FILE = None
+
+    active_diagnosis_file = None
 
     # ========================================================
     # STAGE 1 - REPOSITORY ANALYSIS
@@ -544,8 +835,11 @@ def main():
         AGENTS["repository_analysis"]
     )
 
-    if result["success"] and file_exists(
-        REPOSITORY_CONTEXT_FILE
+    if (
+        result["success"]
+        and file_exists(
+            REPOSITORY_CONTEXT_FILE
+        )
     ):
 
         add_stage_result(
@@ -568,15 +862,15 @@ def main():
             "FAILED",
             {
                 "reason":
-                    "Repository analysis did not complete successfully."
+                    "Repository analysis did not "
+                    "complete successfully."
             }
         )
 
         workflow_failed = True
 
-
     # ========================================================
-    # STAGE 2 - BUG DIAGNOSIS
+    # STAGE 2 - INITIAL BUG DIAGNOSIS
     # ========================================================
 
     if not workflow_failed:
@@ -591,19 +885,34 @@ def main():
         )
 
         diagnosis_available = (
-            file_exists(BUG_REPORT_FILE)
+            file_exists(
+                BUG_REPORT_FILE
+            )
             or
-            file_exists(BUG_REPORT_FILE_2)
+            file_exists(
+                BUG_REPORT_FILE_2
+            )
         )
 
-        if result["success"] and diagnosis_available:
+        if (
+            result["success"]
+            and diagnosis_available
+        ):
 
-            diagnosis_file = (
+            if file_exists(
                 BUG_REPORT_FILE
-                if file_exists(BUG_REPORT_FILE)
-                else BUG_REPORT_FILE_2
-            )
-            ACTIVE_DIAGNOSIS_FILE = diagnosis_file
+            ):
+
+                active_diagnosis_file = (
+                    BUG_REPORT_FILE
+                )
+
+            else:
+
+                active_diagnosis_file = (
+                    BUG_REPORT_FILE_2
+                )
+
             add_stage_result(
                 stage_results,
                 2,
@@ -611,7 +920,7 @@ def main():
                 "SUCCESS",
                 {
                     "diagnosis_file":
-                        diagnosis_file
+                        active_diagnosis_file
                 }
             )
 
@@ -624,352 +933,633 @@ def main():
                 "FAILED",
                 {
                     "reason":
-                        "Bug diagnosis did not complete successfully."
+                        "Bug diagnosis did not "
+                        "complete successfully."
                 }
             )
 
             workflow_failed = True
 
-
     # ========================================================
-    # STAGE 3 - CODE FIX
-    # ========================================================
-
-    if not workflow_failed:
-
-        print_stage(
-            3,
-            "AI Code Fix"
-        )
-
-        result = run_agent(
-            AGENTS["code_fix"],
-            [ACTIVE_DIAGNOSIS_FILE]
-        )
-
-        if result["success"]:
-
-            add_stage_result(
-                stage_results,
-                3,
-                "AI Code Fix",
-                "SUCCESS",
-                {
-                    "message":
-                        "AI code fix agent completed successfully."
-                }
-            )
-
-        elif result["quota_error"]:
-
-            print(
-                "\nGemini quota was exhausted during Code Fix."
-            )
-
-            print(
-                "Checking whether an existing source change "
-                "is available..."
-            )
-
-            if has_source_changes():
-
-                status = "SKIPPED_QUOTA"
-
-                skipped_ai_stages.append(
-                    "Code Fix"
-                )
-
-                add_stage_result(
-                    stage_results,
-                    3,
-                    "AI Code Fix",
-                    status,
-                    {
-                        "reason":
-                            "Gemini quota exhausted.",
-                        "fallback":
-                            "Existing source changes detected.",
-                        "note":
-                            "This stage is NOT marked as AI SUCCESS."
-                    }
-                )
-
-            else:
-
-                add_stage_result(
-                    stage_results,
-                    3,
-                    "AI Code Fix",
-                    "FAILED",
-                    {
-                        "reason":
-                            "Gemini quota exhausted and "
-                            "no existing source change was found."
-                    }
-                )
-
-                workflow_failed = True
-
-        else:
-
-            add_stage_result(
-                stage_results,
-                3,
-                "AI Code Fix",
-                "FAILED",
-                {
-                    "reason":
-                        "Code fix agent failed for a non-quota reason."
-                }
-            )
-
-            workflow_failed = True
-
-
-    # ========================================================
-    # STAGE 4 - TEST GENERATION
+    # RETRY / DEBUGGING LOOP
     # ========================================================
 
     if not workflow_failed:
 
-        print_stage(
-            4,
-            "Test Generation"
-        )
+        attempt = 0
 
-        result = run_agent(
-            AGENTS["test_generation"],
-            [ACTIVE_DIAGNOSIS_FILE]
-        )
+        while attempt <= MAX_RETRIES:
 
-        if result["success"]:
+            attempt += 1
 
-            if existing_tests_available():
+            print_attempt(
+                attempt
+            )
+
+            # ====================================================
+            # RETRY DIAGNOSIS
+            # ====================================================
+
+            if attempt > 1:
+
+                print_stage(
+                    2,
+                    f"Re-Diagnosis "
+                    f"(Retry Attempt {attempt})"
+                )
+
+                retry_bug_report = (
+                    create_retry_failure_context(
+                        attempt - 1,
+                        active_diagnosis_file
+                    )
+                )
+
+                result = run_agent(
+                    AGENTS["bug_diagnosis"],
+                    [
+                        retry_bug_report
+                    ]
+                )
+
+                retry_diagnosis_file = os.path.join(
+                    BASE_DIR,
+                    f"diagnosis_retry_{attempt - 1}.json"
+                )
+
+                # The diagnosis agent normally creates:
+                # bug_report_retry_X.json
+                # -> diagnosis_retry_X.json
+
+                if (
+                    result["success"]
+                    and
+                    file_exists(
+                        retry_diagnosis_file
+                    )
+                ):
+
+                    active_diagnosis_file = (
+                        retry_diagnosis_file
+                    )
+
+                    add_stage_result(
+                        stage_results,
+                        2,
+                        f"Re-Diagnosis "
+                        f"(Attempt {attempt})",
+                        "SUCCESS",
+                        {
+                            "diagnosis_file":
+                                active_diagnosis_file
+                        }
+                    )
+
+                elif result["quota_error"]:
+
+                    add_stage_result(
+                        stage_results,
+                        2,
+                        f"Re-Diagnosis "
+                        f"(Attempt {attempt})",
+                        "SKIPPED_QUOTA",
+                        {
+                            "reason":
+                                "Gemini quota exhausted "
+                                "during retry diagnosis."
+                        }
+                    )
+
+                    retry_history.append(
+                        {
+                            "attempt":
+                                attempt,
+                            "status":
+                                "STOPPED_QUOTA",
+                            "reason":
+                                "Re-diagnosis quota exhausted."
+                        }
+                    )
+
+                    workflow_failed = True
+
+                    break
+
+                else:
+
+                    add_stage_result(
+                        stage_results,
+                        2,
+                        f"Re-Diagnosis "
+                        f"(Attempt {attempt})",
+                        "FAILED",
+                        {
+                            "reason":
+                                "Re-diagnosis failed."
+                        }
+                    )
+
+                    retry_history.append(
+                        {
+                            "attempt":
+                                attempt,
+                            "status":
+                                "FAILED",
+                            "reason":
+                                "Re-diagnosis failed."
+                        }
+                    )
+
+                    workflow_failed = True
+
+                    break
+
+            # ====================================================
+            # STAGE 3 - CODE FIX
+            # ====================================================
+
+            print_stage(
+                3,
+                f"AI Code Fix "
+                f"(Attempt {attempt})"
+            )
+
+            result = run_agent(
+                AGENTS["code_fix"],
+                [
+                    active_diagnosis_file
+                ]
+            )
+
+            if result["success"]:
 
                 add_stage_result(
                     stage_results,
-                    4,
-                    "Test Generation",
+                    3,
+                    f"AI Code Fix "
+                    f"(Attempt {attempt})",
                     "SUCCESS",
                     {
-                        "test_file":
-                            TARGET_TEST_FILE,
+                        "diagnosis_file":
+                            active_diagnosis_file,
                         "message":
-                            "Test generation agent completed and "
-                            "test file is available."
+                            "AI code fix agent completed "
+                            "successfully."
                     }
                 )
+
+            elif result["quota_error"]:
+
+                print(
+                    "\nGemini quota was exhausted "
+                    "during Code Fix."
+                )
+
+                if has_source_changes():
+
+                    skipped_ai_stages.append(
+                        f"Code Fix "
+                        f"(Attempt {attempt})"
+                    )
+
+                    add_stage_result(
+                        stage_results,
+                        3,
+                        f"AI Code Fix "
+                        f"(Attempt {attempt})",
+                        "SKIPPED_QUOTA",
+                        {
+                            "reason":
+                                "Gemini quota exhausted.",
+                            "fallback":
+                                "Existing source changes detected.",
+                            "note":
+                                "This stage is NOT marked "
+                                "as AI SUCCESS."
+                        }
+                    )
+
+                else:
+
+                    add_stage_result(
+                        stage_results,
+                        3,
+                        f"AI Code Fix "
+                        f"(Attempt {attempt})",
+                        "FAILED",
+                        {
+                            "reason":
+                                "Gemini quota exhausted "
+                                "and no existing source "
+                                "change was found."
+                        }
+                    )
+
+                    retry_history.append(
+                        {
+                            "attempt":
+                                attempt,
+                            "status":
+                                "FAILED",
+                            "reason":
+                                "Code fix unavailable."
+                        }
+                    )
+
+                    workflow_failed = True
+
+                    break
 
             else:
 
                 add_stage_result(
                     stage_results,
-                    4,
-                    "Test Generation",
+                    3,
+                    f"AI Code Fix "
+                    f"(Attempt {attempt})",
                     "FAILED",
                     {
                         "reason":
-                            "Agent completed but expected test file "
-                            "was not found."
+                            "Code fix agent failed."
+                    }
+                )
+
+                retry_history.append(
+                    {
+                        "attempt":
+                            attempt,
+                        "status":
+                            "FAILED",
+                        "reason":
+                            "Code fix failed."
                     }
                 )
 
                 workflow_failed = True
 
-        elif result["quota_error"]:
+                break
 
-            print(
-                "\nGemini quota was exhausted during "
-                "Test Generation."
-            )
+            # ====================================================
+            # STAGE 4 - TEST GENERATION
+            # ====================================================
 
-            print(
-                "Checking for an existing test suite..."
-            )
-
-            if existing_tests_available():
-
-                skipped_ai_stages.append(
-                    "Test Generation"
-                )
-
-                add_stage_result(
-                    stage_results,
-                    4,
-                    "Test Generation",
-                    "SKIPPED_QUOTA",
-                    {
-                        "reason":
-                            "Gemini quota exhausted.",
-                        "fallback":
-                            "Existing test suite is available.",
-                        "test_file":
-                            TARGET_TEST_FILE,
-                        "note":
-                            "Existing tests will be executed "
-                            "by the next stage."
-                    }
-                )
-
-            else:
-
-                add_stage_result(
-                    stage_results,
-                    4,
-                    "Test Generation",
-                    "FAILED",
-                    {
-                        "reason":
-                            "Gemini quota exhausted and "
-                            "no existing tests are available."
-                    }
-                )
-
-                workflow_failed = True
-
-        else:
-
-            add_stage_result(
-                stage_results,
+            print_stage(
                 4,
-                "Test Generation",
-                "FAILED",
-                {
-                    "reason":
-                        "Test generation failed for "
-                        "a non-quota reason."
-                }
+                f"Test Generation "
+                f"(Attempt {attempt})"
             )
 
-            workflow_failed = True
+            result = run_agent(
+                AGENTS["test_generation"],
+                [
+                    active_diagnosis_file
+                ]
+            )
 
+            if result["success"]:
 
-    # ========================================================
-    # STAGE 5 - TEST RESULT CHECKER
-    # ========================================================
+                if existing_tests_available():
 
-    if not workflow_failed:
+                    add_stage_result(
+                        stage_results,
+                        4,
+                        f"Test Generation "
+                        f"(Attempt {attempt})",
+                        "SUCCESS",
+                        {
+                            "test_file":
+                                TARGET_TEST_FILE,
+                            "message":
+                                "Test generation agent "
+                                "completed and test file "
+                                "is available."
+                        }
+                    )
 
-        print_stage(
-            5,
-            "Test Result Checker"
-        )
+                else:
 
-        result = run_agent(
-            AGENTS["code_fix"],
-            [ACTIVE_DIAGNOSIS_FILE]
-)
+                    add_stage_result(
+                        stage_results,
+                        4,
+                        f"Test Generation "
+                        f"(Attempt {attempt})",
+                        "FAILED",
+                        {
+                            "reason":
+                                "Agent completed but expected "
+                                "test file was not found."
+                        }
+                    )
 
-        if result["success"]:
+                    workflow_failed = True
 
-            if validate_test_result():
+                    break
 
-                add_stage_result(
-                    stage_results,
-                    5,
-                    "Test Result Checker",
-                    "SUCCESS",
-                    {
-                        "test_result_file":
-                            TEST_RESULT_FILE,
-                        "tests":
-                            "Executed and passed"
-                    }
+            elif result["quota_error"]:
+
+                print(
+                    "\nGemini quota was exhausted "
+                    "during Test Generation."
                 )
+
+                if existing_tests_available():
+
+                    skipped_ai_stages.append(
+                        f"Test Generation "
+                        f"(Attempt {attempt})"
+                    )
+
+                    add_stage_result(
+                        stage_results,
+                        4,
+                        f"Test Generation "
+                        f"(Attempt {attempt})",
+                        "SKIPPED_QUOTA",
+                        {
+                            "reason":
+                                "Gemini quota exhausted.",
+                            "fallback":
+                                "Existing test suite is available.",
+                            "test_file":
+                                TARGET_TEST_FILE
+                        }
+                    )
+
+                else:
+
+                    add_stage_result(
+                        stage_results,
+                        4,
+                        f"Test Generation "
+                        f"(Attempt {attempt})",
+                        "FAILED",
+                        {
+                            "reason":
+                                "Gemini quota exhausted "
+                                "and no existing tests "
+                                "are available."
+                        }
+                    )
+
+                    workflow_failed = True
+
+                    break
 
             else:
 
                 add_stage_result(
                     stage_results,
-                    5,
-                    "Test Result Checker",
+                    4,
+                    f"Test Generation "
+                    f"(Attempt {attempt})",
                     "FAILED",
                     {
                         "reason":
-                            "test_result.json exists but "
-                            "validation indicates test failure."
+                            "Test generation failed."
                     }
                 )
 
                 workflow_failed = True
 
-        else:
+                break
 
-            add_stage_result(
-                stage_results,
+            # ====================================================
+            # STAGE 5 - TEST RESULT CHECKER
+            # ====================================================
+
+            print_stage(
                 5,
-                "Test Result Checker",
-                "FAILED",
-                {
-                    "reason":
-                        "Test Result Checker failed."
-                }
+                f"Test Result Checker "
+                f"(Attempt {attempt})"
             )
 
-            workflow_failed = True
+            # IMPORTANT:
+            # This MUST run test_result_checker.py
+            # and NOT code_fix_agent.py.
 
+            result = run_agent(
+                AGENTS["test_result_checker"]
+            )
 
-    # ========================================================
-    # STAGE 6 - VERIFICATION AGENT
-    # ========================================================
+            test_passed = False
 
-    if not workflow_failed:
+            if result["success"]:
 
-        print_stage(
-            6,
-            "Verification Agent"
-        )
+                test_passed = (
+                    validate_test_result()
+                )
 
-        result = run_agent(
-            AGENTS["verification"]
-        )
+                if test_passed:
 
-        if result["success"]:
+                    add_stage_result(
+                        stage_results,
+                        5,
+                        f"Test Result Checker "
+                        f"(Attempt {attempt})",
+                        "SUCCESS",
+                        {
+                            "test_result_file":
+                                TEST_RESULT_FILE,
+                            "tests":
+                                "All tests passed."
+                        }
+                    )
 
-            if validate_verification():
+                else:
+
+                    add_stage_result(
+                        stage_results,
+                        5,
+                        f"Test Result Checker "
+                        f"(Attempt {attempt})",
+                        "FAILED",
+                        {
+                            "reason":
+                                "Tests were executed but "
+                                "not all tests passed."
+                        }
+                    )
+
+            else:
 
                 add_stage_result(
                     stage_results,
-                    6,
-                    "Verification Agent",
-                    "SUCCESS",
+                    5,
+                    f"Test Result Checker "
+                    f"(Attempt {attempt})",
+                    "FAILED",
                     {
-                        "verification_file":
-                            VERIFICATION_REPORT_FILE
+                        "reason":
+                            "Test Result Checker failed."
                     }
                 )
+
+            # ====================================================
+            # STAGE 6 - VERIFICATION AGENT
+            # ====================================================
+
+            print_stage(
+                6,
+                f"Verification Agent "
+                f"(Attempt {attempt})"
+            )
+
+            result = run_agent(
+                AGENTS["verification"],
+                [
+                    active_diagnosis_file
+                ]
+            )
+
+            verification_passed = False
+
+            if result["success"]:
+
+                verification_passed = (
+                    validate_verification()
+                )
+
+                if verification_passed:
+
+                    add_stage_result(
+                        stage_results,
+                        6,
+                        f"Verification Agent "
+                        f"(Attempt {attempt})",
+                        "SUCCESS",
+                        {
+                            "verification_file":
+                                VERIFICATION_REPORT_FILE,
+                            "bug_status":
+                                "FIXED"
+                        }
+                    )
+
+                else:
+
+                    add_stage_result(
+                        stage_results,
+                        6,
+                        f"Verification Agent "
+                        f"(Attempt {attempt})",
+                        "FAILED",
+                        {
+                            "reason":
+                                "Verification does not "
+                                "confirm the fix."
+                        }
+                    )
 
             else:
 
                 add_stage_result(
                     stage_results,
                     6,
-                    "Verification Agent",
+                    f"Verification Agent "
+                    f"(Attempt {attempt})",
                     "FAILED",
                     {
                         "reason":
-                            "Verification report does not "
-                            "confirm the fix."
+                            "Verification agent failed."
                     }
+                )
+
+            # ====================================================
+            # ATTEMPT RESULT
+            # ====================================================
+
+            attempt_passed = (
+                test_passed
+                and
+                verification_passed
+            )
+
+            retry_history.append(
+                {
+                    "attempt":
+                        attempt,
+
+                    "diagnosis":
+                        active_diagnosis_file,
+
+                    "test_result":
+                        (
+                            "PASS"
+                            if test_passed
+                            else "FAIL"
+                        ),
+
+                    "verification":
+                        (
+                            "PASS"
+                            if verification_passed
+                            else "FAIL"
+                        ),
+
+                    "overall":
+                        (
+                            "PASS"
+                            if attempt_passed
+                            else "FAIL"
+                        )
+                }
+            )
+
+            # ====================================================
+            # SUCCESS -> EXIT LOOP
+            # ====================================================
+
+            if attempt_passed:
+
+                print_header(
+                    f"ATTEMPT {attempt} "
+                    "VERIFICATION PASSED"
+                )
+
+                print(
+                    "\nThe bug fix has been "
+                    "successfully verified."
+                )
+
+                workflow_failed = False
+
+                break
+
+            # ====================================================
+            # FAILURE -> RETRY
+            # ====================================================
+
+            print_header(
+                f"ATTEMPT {attempt} FAILED"
+            )
+
+            if attempt <= MAX_RETRIES:
+
+                print(
+                    "\nRetrying the debugging workflow..."
+                )
+
+                print(
+                    f"Retry {attempt} of "
+                    f"{MAX_RETRIES}"
+                )
+
+                print(
+                    "\nFailure information will be "
+                    "provided to the re-diagnosis agent."
+                )
+
+                continue
+
+            else:
+
+                print(
+                    "\nMaximum retry attempts reached."
                 )
 
                 workflow_failed = True
 
-        else:
-
-            add_stage_result(
-                stage_results,
-                6,
-                "Verification Agent",
-                "FAILED",
-                {
-                    "reason":
-                        "Verification agent failed."
-                }
-            )
-
-            workflow_failed = True
-
+                break
 
     # ========================================================
     # STAGE 7 - FINAL VERIFICATION
@@ -980,40 +1570,38 @@ def main():
         "Final Verification"
     )
 
-    if not workflow_failed:
+    test_passed = validate_test_result()
 
-        test_passed = validate_test_result()
-        verification_passed = validate_verification()
+    verification_passed = (
+        validate_verification()
+    )
 
-        if test_passed and verification_passed:
+    if (
+        not workflow_failed
+        and test_passed
+        and verification_passed
+    ):
 
-            if skipped_ai_stages:
+        if skipped_ai_stages:
 
-                final_status = (
-                    "PASS_WITH_SKIPPED_AI_STAGE"
-                )
+            final_status = (
+                "PASS_WITH_SKIPPED_AI_STAGE"
+            )
 
-                final_message = (
-                    "Workflow passed, but one or more "
-                    "AI stages were skipped because of "
-                    "Gemini quota limitations."
-                )
-
-            else:
-
-                final_status = "PASS"
-
-                final_message = (
-                    "Complete AI agentic debugging workflow "
-                    "passed successfully."
-                )
+            final_message = (
+                "Workflow passed successfully, "
+                "but one or more AI stages were "
+                "skipped because of Gemini quota "
+                "limitations."
+            )
 
         else:
 
-            final_status = "FAIL"
+            final_status = "PASS"
 
             final_message = (
-                "Final verification failed."
+                "Complete AI agentic debugging "
+                "workflow passed successfully."
             )
 
     else:
@@ -1021,7 +1609,8 @@ def main():
         final_status = "FAIL"
 
         final_message = (
-            "Workflow failed before final verification."
+            "The debugging workflow could not "
+            "successfully verify the bug fix."
         )
 
     print("\n")
@@ -1029,16 +1618,25 @@ def main():
     print("FINAL VERIFICATION RESULT")
     print("=" * 70)
 
-    print(f"\nSTATUS: {final_status}")
-    print(f"MESSAGE: {final_message}")
+    print(
+        f"\nSTATUS: {final_status}"
+    )
+
+    print(
+        f"MESSAGE: {final_message}"
+    )
 
     if skipped_ai_stages:
 
-        print("\nAI stages skipped due to quota:")
+        print(
+            "\nAI stages skipped due to quota:"
+        )
 
         for stage in skipped_ai_stages:
-            print(f"  - {stage}")
 
+            print(
+                f"  - {stage}"
+            )
 
     # ========================================================
     # STAGE 8 - WORKFLOW REPORT
@@ -1051,7 +1649,8 @@ def main():
 
     report = create_workflow_report(
         stage_results,
-        final_status
+        final_status,
+        retry_history
     )
 
     print("\n")
@@ -1060,14 +1659,18 @@ def main():
     print("=" * 70)
 
     print(
-        f"\nFinal Status: {report['final_status']}"
+        f"\nFinal Status: "
+        f"{report['final_status']}"
     )
 
     print(
-        f"Workflow Report: {WORKFLOW_REPORT_FILE}"
+        f"Workflow Report: "
+        f"{WORKFLOW_REPORT_FILE}"
     )
 
-    print("\nStage Summary:")
+    print(
+        "\nStage Summary:"
+    )
 
     for stage in stage_results:
 
@@ -1077,10 +1680,27 @@ def main():
             f"{stage['status']}"
         )
 
+    print(
+        "\nRetry Summary:"
+    )
+
+    for retry in retry_history:
+
+        print(
+            f"  Attempt "
+            f"{retry.get('attempt')}: "
+            f"{retry.get('overall', 'N/A')}"
+        )
+
+    return 0 if final_status != "FAIL" else 1
+
 
 # ============================================================
 # ENTRY POINT
 # ============================================================
 
 if __name__ == "__main__":
-    main()
+
+    sys.exit(
+        main()
+    )
