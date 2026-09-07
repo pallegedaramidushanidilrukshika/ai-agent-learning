@@ -1,8 +1,3 @@
-ඔව් 👍 ඔයාට **දැනට තියෙන README.md එක සම්පූර්ණයෙන් delete කරලා**, පහළ තියෙන එක **full content එකම copy-paste** කරන්න.
-
-මේක අපේ දැන් තියෙන **general / technology-aware AI Agentic Software Debugging Workflow** එකට match වෙන විදිහට හදලා තියෙන්නේ. `pytest` / Python-only workflow එකක් විදිහට describe කරන්නේ නැහැ.
-
-````markdown
 # AI Agentic Software Debugging Workflow
 
 ## 1. Project Overview
