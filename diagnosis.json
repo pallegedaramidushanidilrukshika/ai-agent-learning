@@ -1,20 +1,25 @@
 {
-  "bug_title": "Empty task can be added",
+  "bug_title": "Selected task cannot be removed or moved to Completed Tasks",
   "project_type": "Node.js",
-  "root_cause": "The `/addtask` POST route handler in `index.js` receives `req.body.newtask` from the user form. Without proper validation and trimming on the server side (or if empty/whitespace strings bypass client-side checks), empty strings or whitespace-only inputs are allowed to be pushed into the `task` array, resulting in blank items appearing in the task list.",
+  "failure_analysis": "The Remove button and task selection checkboxes are nested inside the same form that posts to /addtask. When the Remove button is clicked, the browser submits the form to /addtask, not /removetask, because the form's action attribute overrides the button's formaction. Consequently, the /removetask route never receives the selected task data, and the task remains in the Added Tasks list.",
+  "root_cause": "The form containing the task list and the Remove button incorrectly uses action=\"/addtask\". The Remove button's formaction attribute is ignored due to the surrounding form's action, causing the POST to /addtask instead of /removetask.",
   "affected_files": [
-    "index.js",
-    "views/index.ejs"
+    "views\\index.ejs"
   ],
   "evidence": [
-    "In `index.js`, `app.post(\"/addtask\", ...)` handles task creation via `req.body.newtask`.",
-    "In `views/index.ejs`, the form `<input type=\"text\" name=\"newtask\" placeholder=\"add new task\" required>` allows whitespace-only input to pass browser validation if spaces are entered."
+    "The form tag in index.ejs has action=\"/addtask\".",
+    "The Remove button inside that form has formaction=\"/removetask\".",
+    "The task checkboxes use name=\"check\" and are inside the same form.",
+    "The /removetask route expects req.body.check to contain selected tasks.",
+    "Reproduction evidence shows the Remove button does not trigger /removetask."
   ],
-  "proposed_fix": "Ensure server-side validation in `index.js` checks that `req.body.newtask` exists, is a string, and is non-empty after trimming whitespace before calling `task.push(newTask.trim())`. In `views/index.ejs`, optional pattern validation or trimming can also be enforced.",
+  "proposed_fix": "Move the task list and Remove button into a separate form that posts to /removetask. Keep the add task form only for adding new tasks. Example:\n\n<form action=\"/addtask\" method=\"POST\">\n  <input type=\"text\" name=\"newtask\" placeholder=\"add new task\">\n  <button>Add Task</button>\n</form>\n\n<form action=\"/removetask\" method=\"POST\">\n  <h2>Added Task</h2>\n  <% for(var i=0;i<task.length;i++){ %>\n    <li><input type=\"checkbox\" name=\"check\" value=\"<%= task[i] %>\"> <%= task[i] %></li>\n  <% } %>\n  <button type=\"submit\">Remove</button>\n</form>\n\nThis ensures the selected tasks are sent to /removetask and processed correctly.",
   "verification_plan": [
-    "Start the Node.js application (`node index.js`).",
-    "Open http://localhost:3000 in a browser.",
-    "Leave the task input empty or enter only spaces, then click 'Add Task'.",
-    "Confirm that no blank entry is added to the 'Added Task' list."
+    "Start the server and navigate to http://localhost:3000.",
+    "Add a new task using the Add Task form.",
+    "Select one or more tasks from the Added Task list.",
+    "Click the Remove button.",
+    "Verify that the selected tasks disappear from the Added Task list and appear in the Completed task list.",
+    "Check the network tab to confirm a POST request is sent to /removetask with the correct form data."
   ]
 }

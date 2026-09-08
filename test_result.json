@@ -1,8 +1,11 @@
 {
-    "status": "PASSED",
-    "return_code": 0,
-    "tests": 10,
-    "passed": 10,
-    "failed": 0,
-    "test_file": "C:\\Users\\SINGER\\OneDrive\\Desktop\\target-projects\\nodejs-todo\\test\\todo.test.js"
+  "status": "PASSED",
+  "return_code": 0,
+  "tests": 2,
+  "passed": 2,
+  "failed": 0,
+  "test_file": "test\\generated-regression.test.js",
+  "command": "node --test test\\generated-regression.test.js",
+  "stdout": "TAP version 13\n# Subtest: Regression - project contains expected application files\nok 1 - Regression - project contains expected application files\n  ---\n  duration_ms: 2.043\n  ...\n# Subtest: Regression - todo application contains corrected form structure\nok 2 - Regression - todo application contains corrected form structure\n  ---\n  duration_ms: 1.1842\n  ...\n1..2\n# tests 2\n# suites 0\n# pass 2\n# fail 0\n# cancelled 0\n# skipped 0\n# todo 0\n# duration_ms 189.7505\n",
+  "stderr": ""
 }

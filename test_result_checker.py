@@ -1,154 +1,227 @@
-import os
-import subprocess
-import sys
 import json
+import os
 import re
+import shlex
+import subprocess
 
-# -----------------------------
-# TARGET PROJECT
-# -----------------------------
 
-project_dir = r"C:\Users\SINGER\OneDrive\Desktop\target-projects\nodejs-todo"
+BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+CONTEXT_PATH = os.path.join(BASE_DIR, "repository_context.json")
+OUTPUT_PATH = os.path.join(BASE_DIR, "test_result.json")
 
-test_file = os.path.join(
-    project_dir,
-    "test",
-    "todo.test.js"
-)
 
-# Result file will be stored inside the learning project
-result_file = os.path.join(
-    os.path.dirname(os.path.abspath(__file__)),
-    "test_result.json"
-)
+def load_json(path):
+    if not os.path.exists(path):
+        return {}
 
-# -----------------------------
-# HEADER
-# -----------------------------
+    try:
+        with open(path, "r", encoding="utf-8") as handle:
+            data = json.load(handle)
+            return data if isinstance(data, dict) else {}
+    except (OSError, json.JSONDecodeError):
+        return {}
 
-print("\n=============================")
-print("AI TEST RESULT CHECKER")
-print("=============================")
 
-print("\nTarget Repository:")
-print(project_dir)
+def write_result(result):
+    with open(OUTPUT_PATH, "w", encoding="utf-8") as handle:
+        json.dump(result, handle, indent=2, ensure_ascii=False)
 
-print("\nTest File:")
-print(test_file)
+    print(json.dumps(result, indent=2, ensure_ascii=False))
 
-# -----------------------------
-# CHECK TEST FILE
-# -----------------------------
 
-if not os.path.exists(test_file):
-    print("\nERROR: Test file does not exist.")
-
-    result_data = {
+def failed_result(message, command=None):
+    return {
         "status": "FAILED",
         "return_code": 1,
         "tests": 0,
         "passed": 0,
         "failed": 0,
-        "test_file": test_file,
-        "error": "Test file does not exist."
+        "test_file": None,
+        "command": command,
+        "stdout": "",
+        "stderr": message,
     }
 
-    with open(result_file, "w", encoding="utf-8") as f:
-        json.dump(result_data, f, indent=4)
 
-    sys.exit(1)
+def parse_node_test_summary(output_text):
+    combined = output_text or ""
 
-# -----------------------------
-# RUN NODE TESTS
-# -----------------------------
+    total = 0
+    passed = 0
+    failed = 0
 
-print("\nRunning Node.js tests...\n")
+    patterns = [
+        (r"(?i)(?:ℹ\s*)?tests?\s+(\d+)", "tests"),
+        (r"(?i)(?:ℹ\s*)?pass(?:ed)?\s+(\d+)", "pass"),
+        (r"(?i)(?:ℹ\s*)?fail(?:ed|ures)?\s+(\d+)", "fail"),
+        (r"(?i)(\d+)\s+tests?", "tests"),
+        (r"(?i)(\d+)\s+pass(?:ed)?", "pass"),
+        (r"(?i)(\d+)\s+fail(?:ed|ures)?", "fail"),
+    ]
 
-result = subprocess.run(
-    [
-        "node",
-        "--test",
-        test_file
-    ],
-    cwd=project_dir,
-    capture_output=True,
-    text=True
+    for pattern, key in patterns:
+        match = re.search(pattern, combined)
+
+        if match:
+            value = int(match.group(1))
+
+            if key == "tests":
+                total = value
+            elif key == "pass":
+                passed = value
+            elif key == "fail":
+                failed = value
+
+    if total == 0 and passed > 0 and failed > 0:
+        total = passed + failed
+
+    return total, passed, failed
+
+
+context = load_json(CONTEXT_PATH)
+
+if not context:
+    write_result(
+        failed_result(
+            "repository_context.json is missing or invalid."
+        )
+    )
+    raise SystemExit(0)
+
+
+target_repo = context.get("repository_path")
+
+if not isinstance(target_repo, str) or not target_repo.strip():
+    write_result(
+        failed_result(
+            "repository_path is missing from repository_context.json."
+        )
+    )
+    raise SystemExit(0)
+
+
+target_repo = os.path.abspath(target_repo)
+
+if not os.path.isdir(target_repo):
+    write_result(
+        failed_result(
+            f"repository_path does not exist: {target_repo}"
+        )
+    )
+    raise SystemExit(0)
+
+
+execution_strategy = context.get("execution_strategy")
+
+if isinstance(execution_strategy, dict):
+    test_command = execution_strategy.get("test_command")
+else:
+    test_command = context.get("test_command")
+
+
+# ---------------------------------------------------------
+# Use generated test file when available
+# ---------------------------------------------------------
+TEST_GENERATION_RESULT_PATH = os.path.join(
+    BASE_DIR,
+    "test_generation_result.json"
 )
 
-# -----------------------------
-# DISPLAY RESULTS
-# -----------------------------
+generation_result = load_json(TEST_GENERATION_RESULT_PATH)
 
-print("=============================")
-print("TEST EXECUTION RESULT")
-print("=============================")
+generated_test_file = generation_result.get("test_file")
 
-print("\nReturn Code:")
-print(result.returncode)
+if (
+    isinstance(generated_test_file, str)
+    and generated_test_file.strip()
+):
+    test_file_path = os.path.join(
+        target_repo,
+        generated_test_file
+    )
 
-print("\nTest Output:")
-print(result.stdout)
+    if os.path.isfile(test_file_path):
+        test_command = f"node --test {generated_test_file}"
 
-if result.stderr:
-    print("\nTest Errors:")
-    print(result.stderr)
+if not test_command:
+    write_result(
+        failed_result(
+            "No test command was detected in repository_context.json."
+        )
+    )
+    raise SystemExit(0)
 
-# -----------------------------
-# EXTRACT TEST COUNTS
-# -----------------------------
 
-output = result.stdout + result.stderr
+if isinstance(test_command, list):
+    command_parts = [str(part) for part in test_command]
+else:
+    try:
+        command_parts = shlex.split(str(test_command), posix=False)
+    except ValueError as error:
+        write_result(
+            failed_result(
+                f"Invalid test command: {error}",
+                str(test_command),
+            )
+        )
+        raise SystemExit(0)
 
-tests_match = re.search(r"(?:ℹ|#)\s*tests\s+(\d+)", output)
-pass_match = re.search(r"(?:ℹ|#)\s*pass\s+(\d+)", output)
-fail_match = re.search(r"(?:ℹ|#)\s*fail\s+(\d+)", output)
 
-total_tests = int(tests_match.group(1)) if tests_match else 0
-passed_tests = int(pass_match.group(1)) if pass_match else 0
-failed_tests = int(fail_match.group(1)) if fail_match else 0
+if not command_parts:
+    write_result(
+        failed_result(
+            "The configured test command is empty.",
+            str(test_command),
+        )
+    )
+    raise SystemExit(0)
 
-# -----------------------------
-# FINAL STATUS
-# -----------------------------
 
-if result.returncode == 0 and total_tests > 0 and failed_tests == 0 and total_tests > 0 and failed_tests == 0:
+try:
+    process = subprocess.run(
+        command_parts,
+        cwd=target_repo,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+except OSError as error:
+    write_result(
+        failed_result(
+            f"Test command could not be executed: {error}",
+            " ".join(command_parts),
+        )
+    )
+    raise SystemExit(0)
 
+
+stdout = process.stdout or ""
+stderr = process.stderr or ""
+combined = (stdout + "\n" + stderr).strip()
+
+tests, passed, failed = parse_node_test_summary(combined)
+
+status = "FAILED"
+
+if (
+    process.returncode == 0
+    and tests > 0
+    and passed == tests
+    and failed == 0
+):
     status = "PASSED"
 
-    print("\n=============================")
-    print("STATUS: ALL TESTS PASSED")
-    print("=============================")
 
-else:
-
-    status = "FAILED"
-
-    print("\n=============================")
-    print("STATUS: TESTS FAILED")
-    print("=============================")
-
-# -----------------------------
-# SAVE MACHINE-READABLE RESULT
-# -----------------------------
-
-result_data = {
+result = {
     "status": status,
-    "return_code": result.returncode,
-    "tests": total_tests,
-    "passed": passed_tests,
-    "failed": failed_tests,
-    "test_file": test_file
+    "return_code": process.returncode,
+    "tests": tests,
+    "passed": passed,
+    "failed": failed,
+    "test_file": generated_test_file if isinstance(generated_test_file, str) else None,
+    "command": " ".join(command_parts),
+    "stdout": stdout,
+    "stderr": stderr,
 }
 
-with open(result_file, "w", encoding="utf-8") as f:
-    json.dump(result_data, f, indent=4)
-
-print("\nTest result saved to:")
-print(result_file)
-
-# -----------------------------
-# EXIT
-# -----------------------------
-
-if result.returncode != 0:
-    sys.exit(result.returncode)
+write_result(result)

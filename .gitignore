@@ -1,5 +1,26 @@
+# Python virtual environment
 venv/
+
+# Environment / secrets
 .env
+
+# Python cache
 __pycache__/
 *.pyc
 .pytest_cache/
+
+# Runtime / generated workflow artifacts
+diagnosis.json
+test_result.json
+verification_report.json
+workflow_report.json
+reproduction_result.json
+
+# Retry / archived runtime artifacts
+bug_report_retry_*.json
+diagnosis_attempt_*.json
+diagnosis_retry_*.json
+
+# Local backups
+*.fixed-backup
+test_generation_agent.py.backup

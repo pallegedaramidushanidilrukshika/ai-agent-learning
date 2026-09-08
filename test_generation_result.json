@@ -1,0 +1,14 @@
+{
+  "status": "PASSED",
+  "message": "LLM test generation failed; controlled Node.js regression test fallback was created.",
+  "technology": "Node.js",
+  "project_category": "node",
+  "languages": [
+    "JavaScript"
+  ],
+  "test_framework": "node:test",
+  "test_command": "node --test",
+  "test_file": "test\\generated-regression.test.js",
+  "fallback": true,
+  "error": "Error code: 429 - {'error': {'message': 'Rate limit reached for model `openai/gpt-oss-20b` in organization `org_01m1k1pm8bettbypk6hr7dhm51` service tier `on_demand` on tokens per day (TPD): Limit 200000, Used 197164, Requested 3015. Please try again in 1m17.328s. Need more tokens? Upgrade to Dev Tier today at https://console.groq.com/settings/billing', 'type': 'tokens', 'code': 'rate_limit_exceeded'}}"
+}

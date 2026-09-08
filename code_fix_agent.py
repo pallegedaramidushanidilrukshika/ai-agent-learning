@@ -24,8 +24,18 @@ if not api_key:
 # PATHS
 # ---------------------------------------------------------
 
+BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+
+REPOSITORY_CONTEXT_FILE = os.path.join(
+    BASE_DIR,
+    "repository_context.json"
+)
+
+with open(REPOSITORY_CONTEXT_FILE, "r", encoding="utf-8") as f:
+    repository_context = json.load(f)
+
 TARGET_REPOSITORY = os.path.abspath(
-    r"C:\Users\SINGER\OneDrive\Desktop\target-projects\nodejs-todo"
+    repository_context["repository_path"]
 )
 
 if len(sys.argv) > 1:

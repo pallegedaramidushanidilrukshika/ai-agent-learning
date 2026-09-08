@@ -1,0 +1,7 @@
+{
+  "bug_title": "Selected task cannot be removed or moved to Completed Tasks",
+  "description": "When a user selects an existing task in the Added Task list and clicks the Remove button, the selected task should be removed from Added Tasks and moved to Completed Tasks. In the buggy version, the Remove action does not correctly submit to the /removetask endpoint because the task controls are associated with the /addtask form.",
+  "expected_behavior": "The selected task should be submitted to POST /removetask, removed from the Added Tasks list, and added to the Completed Tasks list.",
+  "actual_behavior": "The selected task cannot be correctly removed and moved to Completed Tasks.",
+  "severity": "Medium"
+}
