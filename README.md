@@ -464,12 +464,11 @@ Example:
 .env
 .env.example
 ```
+Sensitive configuration such as API keys must be stored in a local .env file.
+
+The repository includes .env.example as a template for the required environment variables.
 
 API keys and other secrets must never be committed to Git.
-
-The `.gitignore` file is configured to prevent sensitive and generated files from being committed where appropriate.
-
----
 
 ## 10. Setup
 
