@@ -47,6 +47,11 @@ if not GROQ_API_KEY:
         "GROQ_API_KEY is not set in the .env file"
     )
 
+if hasattr(sys.stdout, "reconfigure"):
+    sys.stdout.reconfigure(
+        encoding="utf-8",
+        errors="replace",
+    )
 
 # =========================================================
 # Initialize Groq
@@ -178,7 +183,24 @@ IMPORTANT RULES:
 17. Your response MUST contain a complete JSON object.
 18. Never return an empty response.
 19. Do not add explanations before or after the JSON.
-
+20. Diagnose EVERY reported symptom separately.
+21. Do not assume that the first affected file is the only file
+    responsible for the bug.
+22. If the affected file is a frontend/template file, inspect the
+    related backend routes, controllers, handlers, or data-processing
+    logic before deciding the root cause.
+23. Trace the complete data flow involved in the bug:
+    user action -> request/form submission -> backend route/handler
+    -> data processing -> response/rendering.
+24. For bugs involving multiple behaviors, identify the root cause
+    of each behavior separately.
+25. Do not propose a fix based only on HTML structure if backend
+    behavior or application logic may also be involved.
+26. The proposed fix must address the actual runtime behavior,
+    not only make the source code look structurally correct.
+27. If repository evidence is insufficient to determine the root
+    cause, explicitly state what evidence is missing instead of
+    guessing.
 BUG REPORT:
 {json.dumps(bug_report, indent=2)}
 
@@ -235,15 +257,15 @@ message = response.choices[0].message
 
 print("\n===== GROQ DEBUG =====")
 print("Finish reason:", response.choices[0].finish_reason)
-print("Content:", repr(message.content))
-print("Reasoning:", repr(getattr(message, "reasoning", None)))
+print("Content:", repr(message.content).encode("ascii", "backslashreplace").decode("ascii"))
+print("Reasoning:", repr(getattr(message, "reasoning", None)).encode("ascii", "backslashreplace").decode("ascii"))
 print("======================")
 
 result = message.content or ""
 result = result.strip()
 
 print("\nRaw Groq response:")
-print(result)
+print(json.dumps(result, ensure_ascii=False, indent=2))
 
 # =========================================================
 # Clean AI response

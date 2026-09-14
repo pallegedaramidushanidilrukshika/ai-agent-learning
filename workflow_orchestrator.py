@@ -59,10 +59,14 @@ WORKFLOW_REPORT_FILE = os.path.join(
 # ============================================================
 
 STALE_ARTIFACTS = (
+    REPOSITORY_CONTEXT_FILE,
+    REPRODUCTION_RESULT_FILE,
     DIAGNOSIS_FILE,
     TEST_RESULT_FILE,
     VERIFICATION_REPORT_FILE,
     WORKFLOW_REPORT_FILE,
+    os.path.join(BASE_DIR, "build_result.json"),
+    os.path.join(BASE_DIR, "validation_result.json"),
 )
 
 
@@ -365,7 +369,23 @@ def validate_verification():
     ):
         return False
 
-    return validate_test_result()
+    # Verification must be based on the current
+    # test execution result.
+    if not validate_test_result():
+        return False
+
+    # validation_result is optional because some projects use tests
+    # as the only verification mechanism.
+    if "validation_result" in report:
+        validation_result = report.get("validation_result")
+
+        if (
+            validation_result is not None
+            and not isinstance(validation_result, dict)
+        ):
+            return False
+
+    return True
 
 
 # ============================================================

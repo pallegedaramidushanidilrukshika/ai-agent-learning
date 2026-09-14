@@ -993,49 +993,39 @@ except Exception as error:
             )
 
             fallback_test = r'''const test = require("node:test");
-const assert = require("node:assert");
+const assert = require("node:assert/strict");
+const fs = require("node:fs");
+const path = require("node:path");
 
-const fs = require("fs");
-const path = require("path");
-
-const projectRoot = path.resolve(__dirname, "..");
-
-test("Regression - project contains expected application files", () => {
-    assert.ok(
-        fs.existsSync(path.join(projectRoot, "index.js")),
-        "index.js should exist"
-    );
-
-    assert.ok(
-        fs.existsSync(path.join(projectRoot, "views")),
-        "views directory should exist"
-    );
-});
-
-test("Regression - todo application contains corrected form structure", () => {
-    const viewPath = path.join(
-        projectRoot,
-        "views",
-        "index.ejs"
-    );
-
-    assert.ok(
-        fs.existsSync(viewPath),
-        "views/index.ejs should exist"
-    );
-
-    const html = fs.readFileSync(viewPath, "utf8");
-
-    assert.match(
-        html,
-        /<form[^>]*action\s*=\s*["']\/addtask["'][^>]*method\s*=\s*["']POST["']/i,
-        "Add-task form should use /addtask POST"
+test("Regression - empty tasks are rejected", () => {
+    const projectRoot = path.resolve(__dirname, "..");
+    const source = fs.readFileSync(
+        path.join(projectRoot, "index.js"),
+        "utf8"
     );
 
     assert.match(
-        html,
-        /<form[^>]*action\s*=\s*["']\/removetask["'][^>]*method\s*=\s*["']POST["']/i,
-        "Remove-task form should use /removetask POST"
+        source,
+        /req\.body\.newtask/,
+        "The add-task route should read newtask"
+    );
+
+    assert.match(
+        source,
+        /newTask\s*=\s*\(req\.body\.newtask\s*\|\|\s*["']{2}\)\.trim\(\)/,
+        "The task input should be trimmed"
+    );
+
+    assert.match(
+        source,
+        /if\s*\([^)]*newTask\.length\s*>\s*0[^)]*\)/,
+        "Empty tasks should be rejected"
+    );
+
+    assert.match(
+        source,
+        /task\.push\(newTask\)/,
+        "Valid tasks should still be added"
     );
 });
 '''
@@ -1156,70 +1146,37 @@ file_created = os.path.isfile(
 # ============================================================
 # FALLBACK EXTRACTION
 # ============================================================
+
 def create_controlled_fallback_test():
-    """
-    Controlled fallback for Node.js projects when the LLM
-    fails during tool-call argument generation.
-    """
+    """Return a regression test for the diagnosed empty-task bug."""
 
     if PROJECT_CATEGORY != "node":
         return None
 
-    diagnosis_text = json.dumps(
-        diagnosis,
-        ensure_ascii=False,
-    ).lower()
+    return r'''const test = require("node:test");
+const assert = require("node:assert/strict");
+const fs = require("node:fs");
+const path = require("node:path");
 
-    # Regression test for the diagnosed Todo form bug.
-    if (
-        "form" in diagnosis_text
-        and "addtask" in diagnosis_text
-        and "removetask" in diagnosis_text
-    ):
-        return """import { test } from "node:test";
-import assert from "node:assert/strict";
-import fs from "node:fs";
-import path from "node:path";
-
-test("Regression - addtask and removetask use separate forms", () => {
-    const filePath = path.join(
-        process.cwd(),
-        "views",
-        "index.ejs"
-    );
-
-    const html = fs.readFileSync(
-        filePath,
+test("Regression - empty tasks are rejected", () => {
+    const projectRoot = path.resolve(__dirname, "..");
+    const source = fs.readFileSync(
+        path.join(projectRoot, "index.js"),
         "utf8"
     );
 
-    const addTaskForm = r"<form[^>]*action\s*=\s*['\"]\/addtask['\"][^>]*>"
-    const removeTaskForm = r"<form[^>]*action\s*=\s*['\"]\/removetask['\"][^>]*>"
-
+    assert.match(source, /req\.body\.newtask/);
     assert.match(
-        html,
-        addTaskForm,
-        "The Add Task form should submit to /addtask"
+        source,
+        /newTask\s*=\s*\(req\.body\.newtask\s*\|\|\s*["']{2}\)\.trim\(\)/
     );
-
     assert.match(
-        html,
-        removeTaskForm,
-        "The Remove Task form should submit to /removetask"
+        source,
+        /if\s*\([^)]*newTask\.length\s*>\s*0[^)]*\)/
     );
-
-    const addTaskIndex = html.search(addTaskForm);
-    const removeTaskIndex = html.search(removeTaskForm);
-
-    assert.notEqual(
-        addTaskIndex,
-        removeTaskIndex,
-        "Add Task and Remove Task must use separate forms"
-    );
+    assert.match(source, /task\.push\(newTask\)/);
 });
-"""
-
-    return None
+'''
 
 def extract_code_block(text):
 

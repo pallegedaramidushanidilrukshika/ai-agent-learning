@@ -154,8 +154,12 @@ report = {
     "changed_files": [],
     "test_result": test_result,
     "build_result": build_result,
-    "validation_result": validation_result,
-    "diagnosis": diagnosis
+    "diagnosis": diagnosis,
 }
+
+# Include validation_result only when validation was actually performed.
+# Do not write "validation_result": null.
+if validation_result is not None:
+    report["validation_result"] = validation_result
 
 save_report(report)

@@ -28,7 +28,7 @@ OUTPUT_FILE = os.path.join(BASE_DIR, "repository_context.json")
 DEFAULT_REPOSITORY_URL = (
     "https://github.com/"
     "pallegedaramidushanidilrukshika/"
-    "ai-bug-fixing-agent-demo.git"
+    "nodejs-todo-ai-debugging.git"
 )
 
 
