@@ -1,4 +1,5 @@
 import json
+import importlib.util
 import os
 import re
 import shlex
@@ -134,6 +135,16 @@ if not os.path.isdir(TARGET_REPOSITORY):
     )
 
 
+BUG_REPORT_PATH = os.getenv(
+    "BUG_REPORT_FILE",
+    os.path.join(BASE_DIR, "bug_report.json"),
+)
+bug_report = load_json(BUG_REPORT_PATH) or {}
+http_reproduction = bug_report.get("reproduction", {})
+if not isinstance(http_reproduction, dict):
+    http_reproduction = {}
+
+
 # ============================================================
 # EXECUTION STRATEGY
 # ============================================================
@@ -241,8 +252,8 @@ def is_python_project():
 
 def is_java_project():
     return (
-        "java" in technology_text
-        or "java" in language_text
+        bool(re.search(r"\bjava\b", technology_text))
+        or bool(re.search(r"\bjava\b", language_text))
         or "junit" in framework_text
         or "gradle" in str(
             package_manager or ""
@@ -316,6 +327,9 @@ elif is_angular_project():
 
 elif is_react_project():
     PROJECT_CATEGORY = "react"
+
+elif is_node_project():
+    PROJECT_CATEGORY = "node"
 
 else:
     PROJECT_CATEGORY = "unknown"
@@ -445,12 +459,46 @@ def discover_existing_tests():
 
 existing_tests = discover_existing_tests()
 
+architecture = repository_context.get("architecture", {})
+architecture_components = (
+    architecture.get("components", [])
+    if isinstance(architecture, dict)
+    else []
+)
+has_node_backend = (
+    "node.js" in str(execution_strategy.get("backend", "")).lower()
+    or any(
+        isinstance(component, dict)
+        and component.get("type") == "backend"
+        and "node" in str(component.get("technology", "")).lower()
+        for component in architecture_components
+    )
+    or any(
+        isinstance(project, dict)
+        and project.get("technology") == "Node.js"
+        for project in project_types
+    )
+)
+
+configured_http_test = (
+    has_node_backend
+    and isinstance(http_reproduction.get("action"), dict)
+    and isinstance(http_reproduction.get("state_check"), dict)
+)
+
 
 # ============================================================
 # GENERATED TEST PATH
 # ============================================================
 
 def choose_generated_test_path():
+
+    if configured_http_test:
+        return os.path.join(
+            TARGET_REPOSITORY,
+            "test",
+            "generated-http-regression.test.cjs",
+        )
 
     if PROJECT_CATEGORY == "python":
 
@@ -581,6 +629,129 @@ TEST_FILE_RELATIVE = os.path.relpath(
     TEST_FILE,
     TARGET_REPOSITORY,
 )
+
+if configured_http_test:
+    test_framework = "node:test (HTTP integration)"
+    test_command = ["node", "--test", TEST_FILE_RELATIVE]
+
+
+def configured_http_test_source():
+    action = http_reproduction["action"]
+    state_check = http_reproduction["state_check"]
+    test_configuration = {
+        "action": action,
+        "state_check": state_check,
+        "base_url": (
+            execution_strategy.get("backend_base_url")
+            or "http://localhost:5050"
+        ),
+        "bug_title": bug_report.get("bug_title", "HTTP regression"),
+    }
+
+    return f'''const test = require("node:test");
+const assert = require("node:assert/strict");
+
+const configuration = {json.dumps(test_configuration, ensure_ascii=False)};
+const baseUrl = process.env.REPRODUCTION_BASE_URL || configuration.base_url;
+
+async function sendRequest(method, path, data, bodyType) {{
+    const options = {{ method, headers: {{}} }};
+    if (data !== undefined && data !== null) {{
+        if (bodyType === "json") {{
+            options.headers["Content-Type"] = "application/json";
+            options.body = JSON.stringify(data);
+        }} else if (bodyType === "form") {{
+            options.headers["Content-Type"] = "application/x-www-form-urlencoded";
+            options.body = new URLSearchParams(data).toString();
+        }}
+    }}
+    return fetch(new URL(path, baseUrl), options);
+}}
+
+async function readState() {{
+    const response = await sendRequest(
+        configuration.state_check.method,
+        configuration.state_check.path,
+    );
+    assert.equal(response.ok, true, `State request failed: HTTP ${{response.status}}`);
+    return response.json();
+}}
+
+function invalidFields(data) {{
+    return Object.entries(data || {{}}).filter(([, value]) =>
+        value == null || (typeof value === "string" && value.trim() === "")
+    ).map(([field]) => field);
+}}
+
+function isInvalidRecord(record, fields) {{
+    return fields.length > 0 && fields.every((field) =>
+        record[field] == null || String(record[field]).trim() === ""
+    );
+}}
+
+async function removeCreatedRecord(response, records, fields) {{
+    let payload = {{}};
+    try {{ payload = await response.clone().json(); }} catch {{}}
+    let id = payload.insertedId || payload._id;
+    if (!id && Array.isArray(records)) {{
+        const created = records.find((record) => isInvalidRecord(record, fields));
+        id = created && created._id;
+    }}
+    if (id != null) {{
+        const collectionPath = configuration.action.path.replace(/\\/$/, "");
+        await sendRequest("DELETE", `${{collectionPath}}/${{encodeURIComponent(id)}}`);
+    }}
+}}
+
+test(`${{configuration.bug_title}}: invalid request is rejected without state change`, async () => {{
+    const before = await readState();
+    assert.ok(Array.isArray(before), "Configured state endpoint must return an array");
+    const fields = invalidFields(configuration.action.data);
+    assert.ok(fields.length > 0, "Configured action must contain invalid field values");
+    const beforeInvalidCount = before.filter((record) => isInvalidRecord(record, fields)).length;
+
+    const response = await sendRequest(
+        configuration.action.method,
+        configuration.action.path,
+        configuration.action.data,
+        configuration.action.body_type,
+    );
+    const after = await readState();
+
+    try {{
+        assert.ok(response.status >= 400 && response.status < 500,
+            `Expected a 4xx rejection, received HTTP ${{response.status}}`);
+        const afterInvalidCount = after.filter((record) => isInvalidRecord(record, fields)).length;
+        assert.equal(afterInvalidCount, beforeInvalidCount,
+            "Invalid submission created a new invalid record");
+    }} finally {{
+        if (response.ok) await removeCreatedRecord(response, after, fields);
+    }}
+}});
+
+test(`${{configuration.bug_title}}: valid request remains accepted`, async () => {{
+    const validData = Object.fromEntries(
+        Object.entries(configuration.action.data || {{}}).map(([field, value]) => [
+            field,
+            typeof value === "string" && value.trim()
+                ? value
+                : `AI regression ${{field}} ${{Date.now()}}`,
+        ]),
+    );
+    const response = await sendRequest(
+        configuration.action.method,
+        configuration.action.path,
+        validData,
+        configuration.action.body_type,
+    );
+
+    try {{
+        assert.ok(response.ok, `Valid submission failed: HTTP ${{response.status}}`);
+    }} finally {{
+        if (response.ok) await removeCreatedRecord(response, [], []);
+    }}
+}});
+'''
 
 
 # ============================================================
@@ -937,6 +1108,130 @@ print(f"Repository: {TARGET_REPOSITORY}")
 print(f"Test framework: {test_framework}")
 print(f"Test command: {test_command}")
 print(f"Generated test: {TEST_FILE_RELATIVE}")
+
+
+if configured_http_test:
+    try:
+        os.makedirs(os.path.dirname(TEST_FILE), exist_ok=True)
+        with open(TEST_FILE, "w", encoding="utf-8") as file:
+            file.write(configured_http_test_source())
+
+        backend_process = None
+        backend_url = None
+        backend_environment = {}
+
+        if http_reproduction.get("component_type") == "backend":
+            reproduction_agent_path = os.path.join(
+                BASE_DIR,
+                "bug_reproduction_agent.py",
+            )
+            spec = importlib.util.spec_from_file_location(
+                "workflow_reproduction_helpers",
+                reproduction_agent_path,
+            )
+            reproduction_helpers = importlib.util.module_from_spec(spec)
+            spec.loader.exec_module(reproduction_helpers)
+
+            backend_runtime = reproduction_helpers.runtime_configuration(
+                TARGET_REPOSITORY,
+                repository_context,
+                execution_strategy,
+                http_reproduction,
+            )
+            backend_url, backend_environment, endpoint_error = (
+                reproduction_helpers.isolate_local_endpoint(
+                    TARGET_REPOSITORY,
+                    repository_context,
+                    backend_runtime["base_url"],
+                )
+            )
+            if endpoint_error:
+                raise RuntimeError(endpoint_error)
+
+            environment_for_test = os.environ.copy()
+            environment_for_test["REPRODUCTION_BASE_URL"] = backend_url
+            os.environ["REPRODUCTION_BASE_URL"] = backend_url
+            backend_process, start_error = reproduction_helpers.start_application(
+                TARGET_REPOSITORY,
+                backend_runtime["start_command"],
+                base_url=backend_url,
+                readiness_path=backend_runtime["readiness_path"],
+                working_directory=backend_runtime["working_directory"],
+                environment=backend_environment,
+            )
+            if start_error:
+                raise RuntimeError(start_error)
+
+        command = build_test_command()
+        try:
+            process = subprocess.run(
+                command,
+                cwd=TARGET_REPOSITORY,
+                env=environment_for_test if backend_process else None,
+                capture_output=True,
+                text=True,
+                check=False,
+            )
+        finally:
+            if backend_process:
+                reproduction_helpers.stop_process(backend_process)
+
+        stdout = process.stdout or ""
+        stderr = process.stderr or ""
+        combined = f"{stdout}\n{stderr}"
+
+        def test_count(pattern):
+            match = re.search(pattern, combined, re.IGNORECASE)
+            return int(match.group(1)) if match else None
+
+        total_tests = test_count(r"(?:ℹ\s*)?tests\s+(\d+)")
+        passed_tests = test_count(r"(?:ℹ\s*)?pass\s+(\d+)")
+        failed_tests = test_count(r"(?:ℹ\s*)?fail\s+(\d+)")
+        status = (
+            "SUCCESS"
+            if process.returncode == 0 and total_tests and total_tests > 0
+            else "FAILED"
+        )
+
+        result_data = {
+            "status": status,
+            "message": "Configured HTTP regression tests generated and executed.",
+            "technology": technology,
+            "project_category": PROJECT_CATEGORY,
+            "languages": languages,
+            "package_manager": package_manager,
+            "test_framework": test_framework,
+            "test_command": test_command,
+            "execution_command": command,
+            "working_directory": ".",
+            "test_file": TEST_FILE_RELATIVE,
+            "tests": total_tests,
+            "passed": passed_tests,
+            "failed": failed_tests,
+            "return_code": process.returncode,
+            "stdout": stdout,
+            "stderr": stderr,
+            "configured_http_reproduction": True,
+        }
+        save_json(result_data)
+        print(combined)
+        print(json.dumps(result_data, indent=2, ensure_ascii=False))
+        sys.exit(0 if status == "SUCCESS" else 1)
+
+    except Exception as error:
+        result_data = {
+            "status": "FAILED",
+            "message": f"Configured HTTP regression test failed: {error}",
+            "technology": technology,
+            "project_category": PROJECT_CATEGORY,
+            "test_framework": test_framework,
+            "test_command": test_command,
+            "test_file": TEST_FILE_RELATIVE,
+            "return_code": 1,
+        }
+        save_json(result_data)
+        print(result_data["message"])
+        sys.exit(1)
 
 
 # ============================================================

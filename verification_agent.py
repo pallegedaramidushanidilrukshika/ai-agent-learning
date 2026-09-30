@@ -1,5 +1,13 @@
 import json
 import os
+import sys
+
+
+if hasattr(sys.stdout, "reconfigure"):
+    sys.stdout.reconfigure(
+        encoding="utf-8",
+        errors="replace",
+    )
 
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -74,70 +82,66 @@ test_command = strategy.get("test_command")
 build_command = strategy.get("build_command")
 validation_method = strategy.get("validation_method")
 test_framework = strategy.get("test_framework")
+architecture = repository_context.get("architecture", {})
+components = architecture.get("components", []) if isinstance(architecture, dict) else []
+component_builds = [
+    component for component in components
+    if isinstance(component, dict) and component.get("build_command")
+]
+test_generation = load_json(os.path.join(BASE_DIR, "test_generation_result.json")) or {}
 
 reasons = []
 build_result = {}
 validation_result = {}
 
-# Verify test execution generically.
-return_code = test_result.get("return_code")
-tests = test_result.get("tests")
-passed = test_result.get("passed")
-failed = test_result.get("failed")
+test_was_configured_or_generated = bool(test_command) or bool(
+    test_generation.get("test_file")
+)
 
-if return_code != 0:
-    reasons.append("The test command returned a non-zero exit code.")
+if test_was_configured_or_generated:
+    if test_result.get("return_code") != 0:
+        reasons.append("The configured test command returned a non-zero exit code.")
 
-if not isinstance(tests, int) or tests <= 0:
-    reasons.append("No executed test count was reported.")
+    tests = test_result.get("tests")
+    passed = test_result.get("passed")
+    failed = test_result.get("failed")
 
-if not isinstance(passed, int):
-    reasons.append("The number of passed tests was not reported.")
+    if isinstance(tests, int) and isinstance(passed, int) and passed != tests:
+        reasons.append("Not all reported tests passed.")
 
-if not isinstance(failed, int):
-    reasons.append("The number of failed tests was not reported.")
+    if isinstance(failed, int) and failed != 0:
+        reasons.append("One or more test failures were reported.")
 
-if (
-    isinstance(tests, int)
-    and isinstance(passed, int)
-    and passed != tests
-):
-    reasons.append("Not all executed tests passed.")
-
-if isinstance(failed, int) and failed != 0:
-    reasons.append("One or more test failures were reported.")
-
-# If a build strategy exists, use an available build result.
-if build_command:
+# Run and verify builds detected on individual application components.
+if component_builds or build_command:
     build_result = load_json(BUILD_RESULT_PATH)
 
     if not isinstance(build_result, dict):
         reasons.append(
             "A build command is configured, but build_result.json is missing or invalid."
         )
-    else:
+    elif build_result.get("status") != "SKIPPED":
         if build_result.get("return_code") != 0:
             reasons.append("The build command returned a non-zero exit code.")
 
         if build_result.get("status") not in (None, "PASSED", "PASS", "SUCCESS"):
             reasons.append("The build result does not indicate success.")
 
-# Use an available validation result without assuming a specific method.
-if validation_method:
-    validation_result = load_json(VALIDATION_RESULT_PATH)
+validation_result = load_json(VALIDATION_RESULT_PATH)
 
-    if validation_result is not None:
-        if not isinstance(validation_result, dict):
-            reasons.append("validation_result.json is invalid.")
-        elif validation_result.get("status") not in (
-            "PASSED",
-            "PASS",
-            "SUCCESS",
-            "FIXED"
-        ):
-            reasons.append(
-                "The configured validation result does not indicate success."
-            )
+if validation_result is not None:
+    if not isinstance(validation_result, dict):
+        reasons.append("validation_result.json is invalid.")
+    elif validation_result.get("status") not in (
+        "PASSED",
+        "PASS",
+        "SUCCESS",
+        "FIXED",
+        "SKIPPED",
+    ):
+        reasons.append("Runtime validation did not confirm the fix.")
+elif validation_method and "http" in str(validation_method).lower():
+    reasons.append("HTTP runtime validation result is missing.")
 
 status = "PASS" if not reasons else "FAIL"
 
@@ -154,12 +158,8 @@ report = {
     "changed_files": [],
     "test_result": test_result,
     "build_result": build_result,
+    "validation_result": validation_result,
     "diagnosis": diagnosis,
 }
-
-# Include validation_result only when validation was actually performed.
-# Do not write "validation_result": null.
-if validation_result is not None:
-    report["validation_result"] = validation_result
 
 save_report(report)

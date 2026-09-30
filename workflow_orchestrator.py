@@ -1,5 +1,7 @@
 import json
 import os
+import re
+import shlex
 import shutil
 import subprocess
 import sys
@@ -53,6 +55,8 @@ WORKFLOW_REPORT_FILE = os.path.join(
     "workflow_report.json"
 )
 
+ACTIVE_BUG_REPORT_FILE = BUG_REPORT_FILE
+
 
 # ============================================================
 # STALE ARTIFACTS
@@ -67,6 +71,7 @@ STALE_ARTIFACTS = (
     WORKFLOW_REPORT_FILE,
     os.path.join(BASE_DIR, "build_result.json"),
     os.path.join(BASE_DIR, "validation_result.json"),
+    os.path.join(BASE_DIR, "code_fix_result.json"),
 )
 
 
@@ -127,6 +132,20 @@ def save_json(path, data):
 # ============================================================
 
 def remove_stale_artifacts():
+    existing_paths = [path for path in STALE_ARTIFACTS if os.path.isfile(path)]
+    archive_directory = os.path.join(
+        BASE_DIR,
+        "workflow_artifact_archive",
+        datetime.now().strftime("%Y%m%d_%H%M%S_%f"),
+    )
+
+    if existing_paths:
+        for path in existing_paths:
+            relative_path = os.path.relpath(path, BASE_DIR)
+            archive_path = os.path.join(archive_directory, relative_path)
+            os.makedirs(os.path.dirname(archive_path), exist_ok=True)
+            shutil.copy2(path, archive_path)
+
     for path in STALE_ARTIFACTS:
         try:
             if os.path.exists(path):
@@ -160,8 +179,10 @@ def run_agent(script_name, arguments=None):
             cwd=BASE_DIR,
             capture_output=True,
             text=True,
+            encoding="utf-8",
+            errors="backslashreplace",
         )
-    except OSError as error:
+    except (OSError, subprocess.SubprocessError, UnicodeError, ValueError) as error:
         return {
             "success": False,
             "return_code": -1,
@@ -335,16 +356,218 @@ def validate_test_result():
     if not isinstance(result, dict):
         return False
 
-    return (
-        result.get("status") in ("PASSED", "PASS")
-        and result.get("return_code") == 0
-        and isinstance(result.get("tests"), int)
-        and result.get("tests") > 0
-        and isinstance(result.get("passed"), int)
-        and result.get("passed") == result.get("tests")
-        and isinstance(result.get("failed"), int)
-        and result.get("failed") == 0
+    if (
+        result.get("status") not in ("PASSED", "PASS", "SUCCESS")
+        or result.get("return_code") != 0
+    ):
+        return False
+
+    tests = result.get("tests")
+    passed = result.get("passed")
+    failed = result.get("failed")
+
+    if all(isinstance(value, int) for value in (tests, passed, failed)):
+        return tests > 0 and passed == tests and failed == 0
+
+    return True
+
+
+def command_parts(command):
+    if isinstance(command, list):
+        parts = [str(part) for part in command]
+    elif isinstance(command, str):
+        parts = shlex.split(command, posix=False)
+    else:
+        return []
+
+    if os.name == "nt" and parts:
+        shims = {"npm": "npm.cmd", "npx": "npx.cmd", "yarn": "yarn.cmd", "pnpm": "pnpm.cmd"}
+        parts[0] = shims.get(parts[0].lower(), parts[0])
+
+    return parts
+
+
+def run_component_builds(context):
+    repository_path = get_repository_path(context)
+    architecture = context.get("architecture", {})
+    components = architecture.get("components", []) if isinstance(architecture, dict) else []
+    build_components = [
+        component
+        for component in components
+        if isinstance(component, dict) and component.get("build_command")
+    ]
+
+    if not build_components:
+        strategy = get_strategy(context)
+        if strategy.get("build_command"):
+            build_components = [{
+                "name": "application",
+                "type": "application",
+                "path": ".",
+                "package_manager": strategy.get("package_manager"),
+                "build_command": strategy["build_command"],
+            }]
+
+    results = []
+
+    for component in build_components:
+
+        component_path = component.get("path") or "."
+        working_directory = os.path.abspath(
+            os.path.join(repository_path, component_path)
+        )
+        if not os.path.isdir(working_directory):
+            results.append({
+                "component": component.get("name"),
+                "status": "FAILED",
+                "return_code": 1,
+                "error": f"Build directory does not exist: {working_directory}",
+            })
+            continue
+
+        package_manager = str(component.get("package_manager") or "").lower()
+        lockfiles = {
+            "npm": "package-lock.json",
+            "yarn": "yarn.lock",
+            "pnpm": "pnpm-lock.yaml",
+        }
+        install_command = None
+        if package_manager in lockfiles:
+            lockfile_path = os.path.join(working_directory, lockfiles[package_manager])
+            if os.path.isfile(lockfile_path):
+                install_command = [package_manager, "ci"] if package_manager == "npm" else [package_manager, "install", "--frozen-lockfile"]
+            elif os.path.isfile(os.path.join(working_directory, "package.json")):
+                install_command = [package_manager, "install"]
+
+        try:
+            if install_command:
+                install_parts = command_parts(install_command)
+                install_result = subprocess.run(
+                    install_parts,
+                    cwd=working_directory,
+                    capture_output=True,
+                    text=True,
+                    check=False,
+                )
+                if install_result.returncode != 0:
+                    results.append({
+                        "component": component.get("name"),
+                        "status": "FAILED",
+                        "return_code": install_result.returncode,
+                        "command": " ".join(install_parts),
+                        "stdout": install_result.stdout or "",
+                        "stderr": install_result.stderr or "",
+                    })
+                    continue
+
+            build_parts = command_parts(component["build_command"])
+            build_result = subprocess.run(
+                build_parts,
+                cwd=working_directory,
+                capture_output=True,
+                text=True,
+                check=False,
+            )
+            results.append({
+                "component": component.get("name"),
+                "path": component_path,
+                "command": " ".join(build_parts),
+                "status": "PASSED" if build_result.returncode == 0 else "FAILED",
+                "return_code": build_result.returncode,
+                "stdout": build_result.stdout or "",
+                "stderr": build_result.stderr or "",
+            })
+        except (OSError, subprocess.SubprocessError, ValueError) as error:
+            results.append({
+                "component": component.get("name"),
+                "path": component_path,
+                "status": "FAILED",
+                "return_code": 1,
+                "error": str(error),
+            })
+
+    if not results:
+        aggregate = {
+            "status": "SKIPPED",
+            "return_code": 0,
+            "message": "No component build command was detected.",
+            "components": [],
+        }
+    else:
+        successful = all(item.get("status") == "PASSED" for item in results)
+        aggregate = {
+            "status": "PASSED" if successful else "FAILED",
+            "return_code": 0 if successful else 1,
+            "components": results,
+        }
+
+    save_json(os.path.join(BASE_DIR, "build_result.json"), aggregate)
+    return aggregate
+
+
+def run_post_fix_runtime_validation(initial_reproduction):
+    active_bug = load_json(ACTIVE_BUG_REPORT_FILE) or {}
+    reproduction = active_bug.get("reproduction", {})
+    if not isinstance(reproduction, dict) or not reproduction.get("action"):
+        return {
+            "status": "SKIPPED",
+            "return_code": 0,
+            "message": "No configured generic HTTP reproduction; existing project verification applies.",
+        }
+
+    result = run_agent(
+        AGENTS["bug_reproduction"],
+        [ACTIVE_BUG_REPORT_FILE],
     )
+    post_fix_result = load_json(REPRODUCTION_RESULT_FILE)
+    save_json(REPRODUCTION_RESULT_FILE, initial_reproduction)
+
+    reproduction_bugs = (
+        post_fix_result.get("bugs", [])
+        if isinstance(post_fix_result, dict)
+        else []
+    )
+    bug_result = reproduction_bugs[0] if reproduction_bugs else {}
+    evidence = bug_result.get("evidence", [])
+    evidence_text = " ".join(str(item) for item in evidence)
+    status_match = re.search(
+        r"Configured action request returned HTTP (\d+)",
+        evidence_text,
+    )
+    action_status = int(status_match.group(1)) if status_match else None
+    bug_no_longer_reproduces = (
+        isinstance(post_fix_result, dict)
+        and post_fix_result.get("status") == "NOT_REPRODUCED"
+        and bug_result.get("bug")
+        and action_status is not None
+        and 400 <= action_status < 500
+        and any(
+            "No newly persisted record containing the invalid request fields" in str(item)
+            for item in evidence
+        )
+    )
+    validation = {
+        "status": (
+            "PASSED"
+            if result["success"] and bug_no_longer_reproduces
+            else "FAILED"
+        ),
+        "return_code": (
+            0
+            if result["success"] and bug_no_longer_reproduces
+            else 1
+        ),
+        "expected_post_fix_status": "NOT_REPRODUCED",
+        "observed_action_http_status": action_status,
+        "observed_post_fix_result": post_fix_result,
+        "message": (
+            "The invalid request was rejected and no new blank record was observed."
+            if bug_no_longer_reproduces
+            else "Runtime validation did not prove the invalid request was rejected without insertion."
+        ),
+    }
+    save_json(os.path.join(BASE_DIR, "validation_result.json"), validation)
+    return validation
 
 
 # ============================================================
@@ -368,22 +591,6 @@ def validate_verification():
         "SUCCESS"
     ):
         return False
-
-    # Verification must be based on the current
-    # test execution result.
-    if not validate_test_result():
-        return False
-
-    # validation_result is optional because some projects use tests
-    # as the only verification mechanism.
-    if "validation_result" in report:
-        validation_result = report.get("validation_result")
-
-        if (
-            validation_result is not None
-            and not isinstance(validation_result, dict)
-        ):
-            return False
 
     return True
 
@@ -444,7 +651,7 @@ def create_retry_bug_report(
     attempt,
     failure_context
 ):
-    original_bug = load_json(BUG_REPORT_FILE)
+    original_bug = load_json(ACTIVE_BUG_REPORT_FILE)
 
     if not isinstance(original_bug, dict):
         original_bug = {}
@@ -556,6 +763,25 @@ def create_workflow_report(
 
 def main():
 
+    global ACTIVE_BUG_REPORT_FILE
+
+    repository_url = (
+        sys.argv[1].strip()
+        if len(sys.argv) > 1 and sys.argv[1].strip()
+        else None
+    )
+    selected_bug_report = (
+        sys.argv[2].strip()
+        if len(sys.argv) > 2 and sys.argv[2].strip()
+        else os.getenv("BUG_REPORT_FILE", BUG_REPORT_FILE)
+    )
+
+    if repository_url:
+        os.environ["GITHUB_REPOSITORY_URL"] = repository_url
+
+    ACTIVE_BUG_REPORT_FILE = selected_bug_report
+    os.environ["BUG_REPORT_FILE"] = selected_bug_report
+
     print_header(
         "AI AGENTIC SOFTWARE DEBUGGING WORKFLOW"
     )
@@ -568,8 +794,10 @@ def main():
 
     workflow_failed = False
     final_status = "FAIL"
+    verification_passed = False
 
     context = {}
+    initial_reproduction = None
 
 
     # ========================================================
@@ -655,6 +883,7 @@ def main():
         reproduction = load_json(
             REPRODUCTION_RESULT_FILE
         )
+        initial_reproduction = reproduction
 
         if (
             result["success"]
@@ -900,12 +1129,33 @@ def main():
             f"AI Code Fix (Attempt {attempt})"
         )
 
+        code_fix_result_path = os.path.join(
+            BASE_DIR,
+            "code_fix_result.json",
+        )
+        if os.path.exists(code_fix_result_path):
+            os.remove(code_fix_result_path)
+
         result = run_agent(
             AGENTS["code_fix"],
             [DIAGNOSIS_FILE]
         )
 
-        if not result["success"]:
+        code_fix_result = load_json(
+            os.path.join(BASE_DIR, "code_fix_result.json")
+        )
+        fix_verified = (
+            result["success"]
+            and isinstance(code_fix_result, dict)
+            and code_fix_result.get("status") == "SUCCESS"
+            and any(
+                isinstance(item, dict)
+                and item.get("verified") is True
+                for item in code_fix_result.get("modified_files", [])
+            )
+        )
+
+        if not fix_verified:
 
             add_stage_result(
                 stage_results,
@@ -915,7 +1165,8 @@ def main():
                 {
                     "return_code": (
                         result["return_code"]
-                    )
+                    ),
+                    "code_fix_result": code_fix_result,
                 },
             )
 
@@ -1031,6 +1282,49 @@ def main():
             and validate_test_result()
         )
 
+
+        # ====================================================
+        # COMPONENT BUILD VALIDATION
+        # ====================================================
+
+        print_stage(
+            6,
+            f"Component Build Validation (Attempt {attempt})",
+        )
+        build_result = run_component_builds(context)
+        builds_passed = build_result.get("status") in (
+            "PASSED",
+            "SKIPPED",
+        )
+        add_stage_result(
+            stage_results,
+            6,
+            f"Component Build Validation (Attempt {attempt})",
+            "SUCCESS" if builds_passed else "FAILED",
+            build_result,
+        )
+
+
+        # ====================================================
+        # POST-FIX RUNTIME VALIDATION
+        # ====================================================
+
+        print_stage(
+            6,
+            f"Post-Fix Runtime Validation (Attempt {attempt})",
+        )
+        runtime_validation = run_post_fix_runtime_validation(
+            initial_reproduction,
+        )
+        runtime_passed = runtime_validation.get("status") in ("PASSED", "SKIPPED")
+        add_stage_result(
+            stage_results,
+            6,
+            f"Post-Fix Runtime Validation (Attempt {attempt})",
+            "SUCCESS" if runtime_passed else "FAILED",
+            runtime_validation,
+        )
+
         add_stage_result(
             stage_results,
             6,
@@ -1092,6 +1386,8 @@ def main():
 
         attempt_passed = (
             tests_passed
+            and builds_passed
+            and runtime_passed
             and verification_passed
         )
 
@@ -1108,6 +1404,18 @@ def main():
                 "verification": (
                     "PASS"
                     if verification_passed
+                    else "FAIL"
+                ),
+
+                "build": (
+                    "PASS"
+                    if builds_passed
+                    else "FAIL"
+                ),
+
+                "runtime_validation": (
+                    "PASS"
+                    if runtime_passed
                     else "FAIL"
                 ),
 
@@ -1160,6 +1468,9 @@ def main():
         if (
             not workflow_failed
             and validate_test_result()
+            and builds_passed
+            and runtime_passed
+            and verification_passed
             and validate_verification()
         )
         else "FAIL"

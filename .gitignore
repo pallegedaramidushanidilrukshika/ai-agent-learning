@@ -24,3 +24,15 @@ diagnosis_retry_*.json
 # Local backups
 *.fixed-backup
 test_generation_agent.py.backup
+
+build_result.json
+code_fix_result.json
+validation_result.json
+workflow_artifact_archive/
+
+diagnosis.json
+repository_context.json
+test_generation_result.json
+test_result.json
+verification_report.json
+workflow_report.json

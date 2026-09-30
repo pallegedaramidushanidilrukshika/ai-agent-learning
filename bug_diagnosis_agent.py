@@ -28,6 +28,11 @@ DEFAULT_BUG_REPORT_FILE = os.path.join(
     "bug_report.json"
 )
 
+BUG_REPORT_PATH = os.getenv(
+    "BUG_REPORT_FILE",
+    DEFAULT_BUG_REPORT_FILE,
+)
+
 OUTPUT_FILE = os.path.join(
     BASE_DIR,
     "diagnosis.json"
@@ -70,7 +75,7 @@ if len(sys.argv) > 1:
 
 else:
 
-    bug_report_file = DEFAULT_BUG_REPORT_FILE
+    bug_report_file = BUG_REPORT_PATH
 
 
 if os.path.exists(bug_report_file):
@@ -147,6 +152,76 @@ print(
 )
 
 
+def compact_repository_context(context, bug):
+    """Keep diagnosis evidence useful without exceeding model limits."""
+
+    compact = {
+        key: value
+        for key, value in context.items()
+        if key != "file_contents"
+    }
+    file_contents = context.get("file_contents", {})
+
+    if not isinstance(file_contents, dict):
+        compact["file_contents"] = {}
+        return compact
+
+    title = str(bug.get("bug_title", "")).lower()
+    preferred_terms = (
+        "record",
+        "route",
+        "server",
+        "connection",
+        "package.json",
+        "index.js",
+        "app.js",
+        "main.js",
+        "readme",
+    )
+    selected = []
+
+    for path, content in file_contents.items():
+        path_text = str(path).lower()
+        score = sum(term in path_text for term in preferred_terms)
+
+        if "employee" in title and "record" in path_text:
+            score += 3
+
+        selected.append((score, path, content))
+
+    selected.sort(key=lambda item: (-item[0], str(item[1])))
+
+    compact_contents = {}
+    total_chars = 0
+    max_total_chars = 12000
+    max_file_chars = 4000
+
+    for _, path, content in selected:
+        if not isinstance(content, str):
+            continue
+
+        remaining = max_total_chars - total_chars
+        if remaining <= 0:
+            break
+
+        excerpt = content[:min(max_file_chars, remaining)]
+        compact_contents[path] = excerpt
+        total_chars += len(excerpt)
+
+    compact["file_contents"] = compact_contents
+    compact["diagnosis_context_note"] = (
+        "File contents are bounded excerpts selected from repository "
+        "evidence; use reproduction evidence as the primary runtime signal."
+    )
+    return compact
+
+
+diagnosis_repository_context = compact_repository_context(
+    repository_context,
+    bug_report,
+)
+
+
 # =========================================================
 # AI Diagnosis Prompt
 # =========================================================
@@ -208,7 +283,7 @@ BUG REPRODUCTION RESULT:
 {json.dumps(reproduction_result, indent=2)}
 
 REPOSITORY CONTEXT:
-{json.dumps(repository_context, indent=2)}
+{json.dumps(diagnosis_repository_context, indent=2)}
 
 Return exactly this JSON structure:
 

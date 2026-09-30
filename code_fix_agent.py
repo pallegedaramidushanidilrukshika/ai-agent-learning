@@ -1,11 +1,14 @@
 import json
 import os 
+import re
 import sys
+import time
 
 from dotenv import load_dotenv
 from langchain_groq import ChatGroq
 from langchain.agents import create_agent
 from langchain_core.tools import tool
+from groq import Groq
 
 
 
@@ -15,10 +18,12 @@ from langchain_core.tools import tool
 
 load_dotenv()
 
-api_key = os.getenv("GEMINI_API_KEY")
+api_key = os.getenv("GROQ_API_KEY")
 
 if not api_key:
-    raise ValueError("GEMINI_API_KEY was not found.")
+    raise ValueError("GROQ_API_KEY was not found.")
+
+groq_client = Groq(api_key=api_key)
 
 def print_utf8(value):
     text = str(value)
@@ -306,7 +311,17 @@ IMPORTANT DIAGNOSIS RULE:
 - Only modify source files that are directly required to fix
   the diagnosed bug.
 - Do not modify unrelated files.
+TOOL USAGE RULES:
 
+- read_file reads one specific file.
+- search_file searches text inside one specific file.
+- search_file requires exactly:
+  file_path = the path to one file
+  search_text = the text to search for
+- Do NOT pass a directory/folder path to search_file.
+- Do NOT use "path" as the argument name for search_file.
+- When searching a file, always use the exact file path with file_path.
+- Use read_file when you already know the file path and need to inspect its content.
 - You MUST use the write_file tool.
 - You are NOT allowed to finish the task by only describing the fix.
 - After reading the affected file, immediately determine the corrected content.
@@ -348,6 +363,159 @@ Do not change:
 )
 
 
+def apply_direct_fallback(file_names, reason):
+    print_utf8(
+        "\nTool-based code fixing failed; trying direct code generation."
+    )
+    print_utf8(f"Tool-agent error: {reason}")
+
+    for file_name in file_names:
+        if not isinstance(file_name, str):
+            continue
+
+        repository_root = os.path.realpath(TARGET_REPOSITORY)
+        full_path = os.path.abspath(
+            os.path.join(TARGET_REPOSITORY, file_name)
+        )
+        resolved_path = os.path.realpath(full_path)
+        if os.path.commonpath(
+            [repository_root, resolved_path]
+        ) != repository_root:
+            print_utf8(
+                f"Fallback skipped outside target repository: {file_name}"
+            )
+            continue
+
+        previous_result = WRITE_RESULTS.get(full_path, {})
+        if previous_result.get("verified") is True:
+            continue
+
+        current_content = read_file.invoke(
+            {"file_path": file_name}
+        )
+        if current_content.startswith("File does not exist:") or current_content.startswith(
+            "Error:"
+        ):
+            print_utf8(
+                f"Fallback skipped for {file_name}: {current_content}"
+            )
+            continue
+
+        prompt = f"""
+Fix the diagnosed bug in this source file. Return only the complete
+replacement file inside one fenced code block. Do not call tools, add
+explanations, or include a diff.
+
+Diagnosis:
+{json.dumps(diagnosis, indent=2)}
+
+File path: {file_name}
+Current file contents:
+```text
+{current_content}
+```
+"""
+
+        try:
+            response = invoke_with_rate_limit_retry(
+                lambda: groq_client.chat.completions.create(
+                    model="openai/gpt-oss-20b",
+                    messages=[{"role": "user", "content": prompt}],
+                    temperature=0,
+                    max_completion_tokens=4096,
+                    reasoning_effort="low",
+                    include_reasoning=False,
+                )
+            )
+            response_text = response.choices[0].message.content
+            if not isinstance(response_text, str):
+                raise ValueError(
+                    "The model did not return text content."
+                )
+
+            code_blocks = re.findall(
+                r"```[^\r\n]*\r?\n(.*?)\r?\n```",
+                response_text,
+                flags=re.DOTALL,
+            )
+            if len(code_blocks) != 1:
+                raise ValueError(
+                    "The model response must contain exactly one "
+                    "complete-file code block."
+                )
+
+            replacement = code_blocks[0]
+            write_result = json.loads(
+                write_file.invoke(
+                    {
+                        "file_path": file_name,
+                        "content": replacement,
+                    }
+                )
+            )
+            verified_content = read_file.invoke(
+                {"file_path": file_name}
+            )
+            verified = (
+                write_result.get("verified") is True
+                and verified_content == replacement
+            )
+            WRITE_RESULTS[full_path] = {
+                "verified": verified,
+                "message": (
+                    "Direct fallback modification verified."
+                    if verified
+                    else "Direct fallback modification failed verification."
+                ),
+            }
+            print_utf8(
+                f"Fallback for {file_name}: "
+                f"{'verified' if verified else 'not verified'}"
+            )
+        except Exception as error:
+            WRITE_RESULTS[full_path] = {
+                "verified": False,
+                "message": f"Direct fallback failed: {error}",
+            }
+            print_utf8(
+                f"Fallback failed for {file_name}: {error}"
+            )
+
+
+def invoke_with_rate_limit_retry(invoke, attempts=3):
+    for attempt in range(attempts):
+        try:
+            return invoke()
+        except Exception as error:
+            error_text = str(error)
+            if (
+                attempt + 1 >= attempts
+                or "rate_limit_exceeded" not in error_text.lower()
+            ):
+                raise
+
+            retry_match = re.search(
+                r"try again in (?:(\d+)m)?([\d.]+)\s*"
+                r"(ms|milliseconds|s|seconds)",
+                error_text,
+                flags=re.IGNORECASE,
+            )
+            if retry_match:
+                minutes = int(retry_match.group(1) or 0)
+                delay = minutes * 60 + float(retry_match.group(2))
+                if retry_match.group(3).lower() in {"ms", "milliseconds"}:
+                    delay /= 1000
+            else:
+                delay = 1.0
+
+            delay = min(max(delay + 0.1, 0.25), 600.0)
+            print_utf8(
+                f"Groq rate limit reached; retrying in {delay:.2f}s "
+                f"(attempt {attempt + 2}/{attempts})."
+            )
+            time.sleep(delay)
+
+
 # ---------------------------------------------------------
 # RUN CODE FIX AGENT
 # ---------------------------------------------------------
@@ -363,12 +531,16 @@ print("\nDiagnosis:")
 print(json.dumps(diagnosis, indent=2))
 
 
-result = agent.invoke(
-    {
-        "messages": [
-            {
-                "role": "user",
-                "content": f"""
+agent_error = None
+result = None
+
+try:
+    result = agent.invoke(
+        {
+            "messages": [
+                {
+                    "role": "user",
+                    "content": f"""
 Fix the following real application bug.
 
 TARGET REPOSITORY:
@@ -397,10 +569,32 @@ Instructions:
 This is a real application bug-fixing task.
 The goal is to modify the actual application source code.
 """
-            }
-        ]
-    }
-)
+                }
+            ]
+        }
+    )
+except Exception as error:
+    agent_error = error
+    print_utf8(f"Tool-based code fixing failed: {error}")
+
+
+affected_files = diagnosis.get("affected_files", [])
+
+if isinstance(affected_files, str):
+    affected_files = [affected_files]
+
+if not any(
+    WRITE_RESULTS.get(
+        os.path.abspath(os.path.join(TARGET_REPOSITORY, file_name)),
+        {},
+    ).get("verified") is True
+    for file_name in affected_files
+    if isinstance(file_name, str)
+):
+    apply_direct_fallback(
+        affected_files,
+        agent_error or "The tool agent did not verify a source change.",
+    )
 
 
 # ---------------------------------------------------------
@@ -411,18 +605,13 @@ print("\n=============================")
 print("CODE FIX RESULT")
 print("=============================")
 
-for message in result["messages"]:
+for message in result["messages"] if result is not None else []:
 
     if message.content:
         print("\nMessage:")
         print_utf8(message.content)
 
 
-
-affected_files = diagnosis.get("affected_files", [])
-
-if isinstance(affected_files, str):
-    affected_files = [affected_files]
 
 verified_files = []
 

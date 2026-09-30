@@ -2,8 +2,12 @@ import json
 import os
 import re
 import shlex
+import shutil
+import socket
 import subprocess
+import sys
 import time
+from urllib.parse import urlsplit, urlunsplit
 import urllib.parse
 import urllib.request
 import urllib.error
@@ -18,7 +22,7 @@ REPOSITORY_CONTEXT_FILE = os.path.join(
 
 BUG_REPORT_FILE = os.path.join(
     BASE_DIR,
-    "bug_report.json",
+    "bug_report_level2.json",
 )
 
 REPRODUCTION_RESULT_FILE = os.path.join(
@@ -26,8 +30,320 @@ REPRODUCTION_RESULT_FILE = os.path.join(
     "reproduction_result.json",
 )
 
-BASE_URL = "http://localhost:3000"
+LEVEL1_BASE_URL = "http://localhost:3000"
+APPLICATION_STARTUP_TIMEOUT_SECONDS = 35
 
+
+def normalize_base_url(base_url):
+    if not isinstance(base_url, str) or not base_url.strip():
+        return None
+
+    return base_url.rstrip("/")
+
+
+def parse_response_body(body):
+    try:
+        return json.loads(body)
+    except (TypeError, json.JSONDecodeError):
+        return None
+
+
+def component_for_type(repository_context, component_type):
+    architecture = repository_context.get("architecture", {})
+
+    if not isinstance(architecture, dict):
+        return {}
+
+    components = architecture.get("components", [])
+
+    if not isinstance(components, list):
+        return {}
+
+    for component in components:
+        if (
+            isinstance(component, dict)
+            and component.get("type") == component_type
+        ):
+            return component
+
+    return {}
+
+
+def detect_backend_base_url(repository_path, repository_context):
+    configured_url = os.getenv("REPRODUCTION_BASE_URL")
+
+    if configured_url:
+        return normalize_base_url(configured_url)
+
+    backend = component_for_type(repository_context, "backend")
+    evidence_files = backend.get("evidence", [])
+
+    if not isinstance(evidence_files, list):
+        evidence_files = []
+
+    candidate_files = list(evidence_files)
+    repository_files = repository_context.get("files", [])
+
+    if isinstance(repository_files, list):
+        candidate_files.extend(
+            file
+            for file in repository_files
+            if os.path.basename(file).lower() in {
+                "server.js",
+                "app.js",
+                "index.js",
+                "main.js",
+            }
+        )
+
+    for relative_path in dict.fromkeys(candidate_files):
+        try:
+            content = read_file(
+                os.path.join(repository_path, relative_path)
+            )
+        except (OSError, UnicodeError):
+            continue
+
+        port_match = re.search(
+            r"process\.env\.PORT\s*\|\|\s*(\d+)",
+            content,
+        )
+
+        if port_match:
+            return f"http://localhost:{port_match.group(1)}"
+
+    return None
+
+
+def resolve_base_url(repository_path, repository_context, bug_definition):
+    configured_url = bug_definition.get("base_url")
+
+    if configured_url:
+        return normalize_base_url(configured_url)
+
+    component_type = bug_definition.get("component_type")
+
+    if component_type:
+        component_url = component_for_type(
+            repository_context,
+            component_type,
+        ).get("base_url")
+
+        if component_url:
+            return normalize_base_url(component_url)
+
+    if component_type == "backend":
+        execution_strategy = repository_context.get(
+            "execution_strategy",
+            {},
+        )
+
+        if isinstance(execution_strategy, dict):
+            strategy_url = execution_strategy.get(
+                "backend_base_url"
+            )
+
+            if strategy_url:
+                return normalize_base_url(strategy_url)
+
+        return detect_backend_base_url(
+            repository_path,
+            repository_context,
+        )
+
+    return normalize_base_url(
+        os.getenv("REPRODUCTION_BASE_URL")
+    )
+
+
+def configured_port_variable(repository_path, repository_context):
+    backend = component_for_type(repository_context, "backend")
+    component_path = backend.get("path", "")
+    repository_files = repository_context.get("files", [])
+
+    if not isinstance(repository_files, list):
+        return None
+
+    entry_names = {"server.js", "app.js", "index.js", "main.js"}
+    for relative_path in repository_files:
+        normalized_path = relative_path.replace("\\", "/")
+        if component_path:
+            component_prefix = component_path.replace("\\", "/").rstrip("/") + "/"
+            if not normalized_path.startswith(component_prefix):
+                continue
+
+        if os.path.basename(normalized_path).lower() not in entry_names:
+            continue
+
+        try:
+            source = read_file(os.path.join(repository_path, relative_path))
+        except (OSError, UnicodeError):
+            continue
+
+        match = re.search(
+            r"process\.env\.([A-Za-z_][A-Za-z0-9_]*)\s*\|\|\s*(\d+)",
+            source,
+        )
+        if match:
+            return match.group(1), int(match.group(2))
+
+    return None
+
+
+def isolate_local_endpoint(repository_path, repository_context, base_url):
+    """Avoid reproducing against an unrelated process already on the port."""
+
+    parsed = urlsplit(base_url)
+
+    if parsed.scheme not in {"http", "https"} or parsed.hostname not in {
+        "localhost",
+        "127.0.0.1",
+    }:
+        return base_url, {}, None
+
+    port = parsed.port or (443 if parsed.scheme == "https" else 80)
+    try:
+        with socket.create_connection(
+            (parsed.hostname, port),
+            timeout=0.25,
+        ):
+            occupied = True
+    except OSError:
+        occupied = False
+
+    if not occupied:
+        return base_url, {}, None
+
+    port_setting = configured_port_variable(
+        repository_path,
+        repository_context,
+    )
+    if not port_setting:
+        return None, {}, (
+            f"Configured application URL {base_url} is already in use, "
+            "and no configurable port setting was found in the backend. "
+            "Refusing to reproduce against a potentially unrelated process."
+        )
+
+    variable_name, configured_port = port_setting
+    if configured_port != port:
+        return None, {}, (
+            f"Configured application URL {base_url} is already in use, "
+            f"but the backend's {variable_name} default does not match "
+            "the configured URL port."
+        )
+
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as listener:
+        listener.bind(("127.0.0.1", 0))
+        free_port = listener.getsockname()[1]
+
+    netloc = f"{parsed.hostname}:{free_port}"
+    isolated_url = urlunsplit(
+        (parsed.scheme, netloc, parsed.path, parsed.query, parsed.fragment)
+    )
+    return isolated_url, {variable_name: str(free_port)}, None
+
+
+def level1_empty_task_definition():
+    return {
+        "bug": "Empty Task can be added",
+        "base_url": LEVEL1_BASE_URL,
+        "component_type": "backend",
+        "readiness_path": "/",
+        "action": {
+            "method": "POST",
+            "path": "/addtask",
+            "data": {"newtask": ""},
+            "body_type": "form",
+        },
+    }
+
+
+def level1_remove_task_definition():
+    return {
+        "bug": "Selected task cannot be moved to Completed Tasks",
+        "base_url": LEVEL1_BASE_URL,
+        "component_type": "backend",
+        "readiness_path": "/",
+    }
+
+
+def mern_empty_employee_definition():
+    return {
+        "bug": "Employee creation accepts empty required fields",
+        "expected_behavior": (
+            "Submitting the Create Employee form with empty required fields "
+            "should be rejected and must not create a blank employee record."
+        ),
+        "component_type": "backend",
+        "readiness_path": "/record",
+        "action": {
+            "method": "POST",
+            "path": "/record",
+            "data": {
+                "name": "",
+                "position": "",
+                "level": "",
+            },
+            "body_type": "json",
+        },
+        "state_check": {
+            "method": "GET",
+            "path": "/record",
+        },
+    }
+
+
+def bug_definition_for_report(bug_report):
+    title = str(
+        bug_report.get("bug_title", "")
+    ).strip().lower()
+
+    reproduction = bug_report.get(
+        "reproduction"
+    )
+
+    if isinstance(reproduction, dict):
+        action = reproduction.get("action")
+
+        if isinstance(action, dict):
+            return {
+                "bug": bug_report.get(
+                    "bug_title",
+                    "Configured bug",
+                ),
+                "component_type": reproduction.get(
+                    "component_type",
+                    "http",
+                ),
+                "readiness_path": reproduction.get(
+                    "readiness_path",
+                    "/",
+                ),
+                "action": action,
+                "state_check": reproduction.get(
+                    "state_check"
+                ),
+                "expected_behavior": bug_report.get(
+                    "expected_behavior"
+                ),
+            }
+
+    level1_remove_titles = {
+        "selected task cannot be moved to completed tasks",
+        "selected task cannot be removed or moved to completed tasks",
+    }
+
+    if title in level1_remove_titles:
+        return level1_remove_task_definition()
+
+    if "empty" in title and "task" in title:
+        return level1_empty_task_definition()
+
+    if title == "employee creation accepts empty required fields":
+        return mern_empty_employee_definition()
+
+    return None
 
 def load_json(file_path):
     with open(file_path, "r", encoding="utf-8") as file:
@@ -41,12 +357,71 @@ def read_file(file_path):
 
 def command_parts(command):
     if isinstance(command, list):
-        return [str(part) for part in command]
+        parts = [str(part) for part in command]
+    elif isinstance(command, str):
+        parts = shlex.split(command)
+    else:
+        return []
 
-    if isinstance(command, str):
-        return shlex.split(command)
+    if os.name == "nt" and parts:
+        executable = parts[0].lower()
+        windows_shims = {
+            "npm": "npm.cmd",
+            "npx": "npx.cmd",
+            "pnpm": "pnpm.cmd",
+            "yarn": "yarn.cmd",
+        }
 
-    return []
+        if executable in windows_shims:
+            parts[0] = windows_shims[executable]
+
+    return parts
+
+
+def resolve_start_command(working_directory, command):
+    """Run simple npm start scripts directly when they invoke Node itself."""
+
+    parts = command_parts(command)
+
+    if not parts or os.path.basename(parts[0]).lower() not in {
+        "npm",
+        "npm.cmd",
+    }:
+        return parts
+
+    script_index = None
+    if len(parts) == 2 and parts[1] == "start":
+        script_index = 1
+    elif len(parts) == 3 and parts[1:3] == ["run", "start"]:
+        script_index = 2
+
+    if script_index is None:
+        return parts
+
+    package_path = os.path.join(working_directory, "package.json")
+    try:
+        with open(package_path, "r", encoding="utf-8") as file:
+            package_data = json.load(file)
+    except (OSError, json.JSONDecodeError):
+        return parts
+
+    scripts = package_data.get("scripts", {})
+    start_script = scripts.get("start") if isinstance(scripts, dict) else None
+    if not isinstance(start_script, str):
+        return parts
+
+    try:
+        script_parts = shlex.split(start_script)
+    except ValueError:
+        return parts
+
+    if not script_parts or os.path.basename(script_parts[0]).lower() not in {
+        "node",
+        "node.exe",
+    }:
+        return parts
+
+    return script_parts
 
 
 def stop_process(process):
@@ -62,30 +437,77 @@ def stop_process(process):
         process.wait(timeout=3)
 
 
-def start_application(repository_path, start_command):
-    parts = command_parts(start_command)
+def prepare_runtime_configuration(working_directory):
+    """Create ignored runtime config only when a tracked example exists."""
+
+    config_path = os.path.join(
+        working_directory,
+        "config.env",
+    )
+    example_path = os.path.join(
+        working_directory,
+        "config.env.example",
+    )
+
+    if os.path.exists(config_path) or not os.path.isfile(example_path):
+        return None
+
+    shutil.copyfile(example_path, config_path)
+    return config_path
+
+
+def start_application(
+    repository_path,
+    start_command,
+    base_url=None,
+    readiness_path="/",
+    working_directory=None,
+    environment=None,
+):
+    working_directory = working_directory or repository_path
+    parts = resolve_start_command(
+        working_directory,
+        start_command,
+    )
 
     if not parts:
         return None, "The configured start_command is empty."
 
+    base_url = normalize_base_url(base_url)
+
+    if not base_url:
+        return None, "No application base URL was configured."
+
     try:
-        # Install dependencies for Node.js projects before starting.
+        prepared_config = prepare_runtime_configuration(
+            working_directory,
+        )
+
+        if prepared_config:
+            print(
+                "Created runtime configuration from config.env.example: "
+                f"{prepared_config}"
+            )
+
         package_json = os.path.join(
-            repository_path,
+            working_directory,
             "package.json",
         )
 
         if os.path.exists(package_json):
-            print("\n--- Installing Node.js Dependencies ---")
+            print("\n--- Installing Application Dependencies ---")
 
             npm_command = "npm.cmd" if os.name == "nt" else "npm"
+            install_command = [npm_command, "install"]
+            if os.path.isfile(os.path.join(working_directory, "package-lock.json")):
+                install_command = [npm_command, "ci"]
 
             install_process = subprocess.run(
-            [npm_command, "install"],
-            cwd=repository_path,
-            capture_output=True,
-            text=True,
-            timeout=300,
+                install_command,
+                cwd=working_directory,
+                capture_output=True,
+                text=True,
+                timeout=300,
             )
 
             if install_process.returncode != 0:
@@ -100,15 +522,22 @@ def start_application(repository_path, start_command):
         last_error = "Application did not become ready."
 
         for attempt in range(1, 4):
+            process_environment = os.environ.copy()
+            if environment:
+                process_environment.update(environment)
+
             process = subprocess.Popen(
                 parts,
-                cwd=repository_path,
+                cwd=working_directory,
+                env=process_environment,
                 stdout=subprocess.PIPE,
                 stderr=subprocess.PIPE,
                 text=True,
             )
 
-            deadline = time.time() + 10
+            deadline = (
+                time.time() + APPLICATION_STARTUP_TIMEOUT_SECONDS
+            )
 
             while time.time() < deadline:
                 if process.poll() is not None:
@@ -120,9 +549,27 @@ def start_application(repository_path, start_command):
                     )
                     break
 
-                probe = http_request("GET", "/")
+                probe = http_request(
+                    "GET",
+                    readiness_path,
+                    base_url=base_url,
+                )
 
                 if probe["success"] or probe["status_code"] is not None:
+                    time.sleep(0.25)
+
+                    if process.poll() is not None:
+                        stdout, stderr = process.communicate(timeout=2)
+                        last_error = (
+                            "A readiness response was received, but the "
+                            "application process started for this run exited. "
+                            "Another process may already be serving the "
+                            "configured URL.\n"
+                            f"STDOUT:\n{stdout}\n"
+                            f"STDERR:\n{stderr}"
+                        )
+                        break
+
                     return process, None
 
                 time.sleep(0.25)
@@ -130,7 +577,8 @@ def start_application(repository_path, start_command):
                 stop_process(process)
                 stdout, stderr = process.communicate(timeout=2)
                 last_error = (
-                    "Application did not become ready within 10 seconds.\n"
+                    "Application did not become ready within "
+                    f"{APPLICATION_STARTUP_TIMEOUT_SECONDS} seconds.\n"
                     f"STDOUT:\n{stdout}\n"
                     f"STDERR:\n{stderr}"
                 )
@@ -148,30 +596,57 @@ def http_request(
     method,
     path,
     data=None,
+    base_url=None,
+    body_type="form",
+    timeout=5,
 ):
-    url = f"{BASE_URL}{path}"
+    base_url = normalize_base_url(base_url)
+
+    if not base_url:
+        return {
+            "success": False,
+            "status_code": None,
+            "body": "",
+            "error": "No application base URL was configured.",
+        }
+
+    normalized_path = path if str(path).startswith("/") else f"/{path}"
+    url = f"{base_url}{normalized_path}"
 
     encoded_data = None
+    headers = {}
 
     if data is not None:
-        encoded_data = urllib.parse.urlencode(
-            data,
-            doseq=True,
-        ).encode("utf-8")
+        if body_type == "json":
+            encoded_data = json.dumps(data).encode("utf-8")
+            headers["Content-Type"] = "application/json"
+        elif body_type == "form":
+            encoded_data = urllib.parse.urlencode(
+                data,
+                doseq=True,
+            ).encode("utf-8")
+            headers["Content-Type"] = (
+                "application/x-www-form-urlencoded"
+            )
+        else:
+            return {
+                "success": False,
+                "status_code": None,
+                "body": "",
+                "error": f"Unsupported request body type: {body_type}",
+            }
 
     request = urllib.request.Request(
         url,
         data=encoded_data,
         method=method,
-        headers={
-            "Content-Type": "application/x-www-form-urlencoded",
-        },
+        headers=headers,
     )
 
     try:
         response = urllib.request.urlopen(
             request,
-            timeout=5,
+            timeout=timeout,
         )
 
         body = response.read().decode(
@@ -180,7 +655,7 @@ def http_request(
         )
 
         return {
-            "success": True,
+            "success": 200 <= response.status < 400,
             "status_code": response.status,
             "body": body,
             "error": None,
@@ -323,6 +798,7 @@ def reproduce_empty_task_bug(
     start_command,
     validation_method,
     process,
+    base_url=LEVEL1_BASE_URL,
 ):
     """
     Actually reproduce the Empty Task bug by submitting:
@@ -401,6 +877,7 @@ def reproduce_empty_task_bug(
     before_response = http_request(
         "GET",
         "/",
+        base_url=base_url,
     )
 
     if not before_response["success"]:
@@ -436,6 +913,8 @@ def reproduce_empty_task_bug(
         {
             "newtask": "",
         },
+        base_url=base_url,
+        body_type="form",
     )
 
     evidence.append(
@@ -451,6 +930,7 @@ def reproduce_empty_task_bug(
     after_response = http_request(
         "GET",
         "/",
+        base_url=base_url,
     )
 
     if not after_response["success"]:
@@ -521,6 +1001,7 @@ def reproduce_remove_task_bug(
     start_command,
     validation_method,
     process,
+    base_url=LEVEL1_BASE_URL,
 ):
     """
     Actually reproduce the Remove -> Completed Task bug.
@@ -612,6 +1093,8 @@ def reproduce_remove_task_bug(
         {
             "newtask": test_task,
         },
+        base_url=base_url,
+        body_type="form",
     )
 
     evidence.append(
@@ -641,6 +1124,7 @@ def reproduce_remove_task_bug(
     before_remove = http_request(
         "GET",
         "/",
+        base_url=base_url,
     )
 
     if not before_remove["success"]:
@@ -684,6 +1168,8 @@ def reproduce_remove_task_bug(
         {
             "check": test_task,
         },
+        base_url=base_url,
+        body_type="form",
     )
 
     evidence.append(
@@ -699,6 +1185,7 @@ def reproduce_remove_task_bug(
     after_remove = http_request(
         "GET",
         "/",
+        base_url=base_url,
     )
 
     if not after_remove["success"]:
@@ -788,6 +1275,253 @@ def reproduce_remove_task_bug(
     }
 
 
+def reproduction_result(
+    status,
+    bug,
+    observed_behavior,
+    expected_behavior,
+    evidence,
+    application_status,
+):
+    return {
+        "status": status,
+        "bug": bug,
+        "observed_behavior": observed_behavior,
+        "expected_behavior": expected_behavior,
+        "evidence": evidence,
+        "application_status": application_status,
+    }
+
+
+def record_is_empty(record):
+    if not isinstance(record, dict):
+        return False
+
+    return all(
+        not str(record.get(field, "") or "").strip()
+        for field in ("name", "position", "level")
+    )
+
+
+def record_id(record):
+    if not isinstance(record, dict):
+        return None
+
+    value = record.get("_id")
+    return str(value) if value is not None else None
+
+
+def records_from_response(response):
+    payload = parse_response_body(response.get("body", ""))
+    return payload if isinstance(payload, list) else []
+
+
+def invalid_fields_from_payload(payload):
+    if not isinstance(payload, dict):
+        return []
+
+    return [
+        field
+        for field, value in payload.items()
+        if value is None
+        or (isinstance(value, str) and not value.strip())
+    ]
+
+
+def record_matches_invalid_fields(record, fields):
+    return (
+        isinstance(record, dict)
+        and bool(fields)
+        and all(
+            record.get(field) is None
+            or (
+                isinstance(record.get(field), str)
+                and not record[field].strip()
+            )
+            for field in fields
+        )
+    )
+
+
+def reproduce_http_bug(
+    repository_path,
+    process,
+    base_url,
+    bug_definition,
+):
+    """Run a configured HTTP reproduction and validate observed state."""
+
+    bug = bug_definition["bug"]
+    action = bug_definition["action"]
+    expected_behavior = bug_definition.get(
+        "expected_behavior",
+        "The configured invalid HTTP action should be rejected without "
+        "creating a record containing the submitted invalid field values.",
+    )
+    evidence = []
+
+    if process is None:
+        return reproduction_result(
+            "NOT_REPRODUCED",
+            bug,
+            "The application was not running, so the actual HTTP "
+            "reproduction could not be performed.",
+            expected_behavior,
+            evidence,
+            None,
+        )
+
+    state_check = bug_definition.get("state_check")
+    before_response = http_request(
+        state_check["method"],
+        state_check["path"],
+        base_url=base_url,
+    )
+
+    if not before_response["success"]:
+        evidence.append(
+            f"Initial {state_check['method']} {state_check['path']} "
+            f"failed with HTTP {before_response['status_code']}."
+        )
+        return reproduction_result(
+            "NOT_REPRODUCED",
+            bug,
+            "The application was running, but the initial employee "
+            "state could not be loaded.",
+            expected_behavior,
+            evidence,
+            before_response["status_code"],
+        )
+
+    before_records = records_from_response(before_response)
+    invalid_fields = invalid_fields_from_payload(action.get("data"))
+    before_invalid_count = sum(
+        1
+        for record in before_records
+        if record_matches_invalid_fields(record, invalid_fields)
+    )
+    evidence.append(
+        f"Initial {state_check['method']} {state_check['path']} "
+        f"returned HTTP {before_response['status_code']} with "
+        f"{len(before_records)} records."
+    )
+
+    action_response = http_request(
+        action["method"],
+        action["path"],
+        action.get("data"),
+        base_url=base_url,
+        body_type=action.get("body_type", "form"),
+    )
+    action_payload = parse_response_body(action_response.get("body", ""))
+    inserted_id = None
+
+    if isinstance(action_payload, dict):
+        inserted_id = action_payload.get("insertedId")
+        if inserted_id is not None:
+            inserted_id = str(inserted_id)
+
+    evidence.append(
+        f"Submitted {action['method']} {action['path']} with "
+        f"{action.get('body_type', 'form')} data."
+    )
+    evidence.append(
+        f"Configured action request returned HTTP "
+        f"{action_response['status_code']}."
+    )
+    response_body = action_response.get("body", "")
+    if response_body:
+        evidence.append(
+            "POST response body: "
+            f"{response_body[:500]}"
+        )
+
+    after_response = http_request(
+        state_check["method"],
+        state_check["path"],
+        base_url=base_url,
+    )
+
+    if not after_response["success"]:
+        evidence.append(
+            f"Final {state_check['method']} {state_check['path']} "
+            f"failed with HTTP {after_response['status_code']}."
+        )
+        return reproduction_result(
+            "NOT_REPRODUCED",
+            bug,
+            "The empty-employee request was sent, but the resulting "
+            "employee state could not be inspected.",
+            expected_behavior,
+            evidence,
+            after_response["status_code"],
+        )
+
+    after_records = records_from_response(after_response)
+    after_invalid_records = [
+        record
+        for record in after_records
+        if record_matches_invalid_fields(record, invalid_fields)
+    ]
+    created_blank_record = (
+        len(after_invalid_records) > before_invalid_count
+        or (
+            inserted_id is not None
+            and any(
+                record_id(record) == inserted_id
+                for record in after_invalid_records
+            )
+        )
+    )
+
+    if created_blank_record:
+        evidence.append(
+            "The final state contains a newly persisted record with "
+            "empty values for the invalid fields in the request."
+        )
+
+        if inserted_id:
+            cleanup_path = (
+                state_check["path"].rstrip("/")
+                + "/"
+                + urllib.parse.quote(inserted_id, safe="")
+            )
+            cleanup_response = http_request(
+                "DELETE",
+                cleanup_path,
+                base_url=base_url,
+            )
+            evidence.append(
+                f"Cleanup DELETE {cleanup_path} returned HTTP "
+                f"{cleanup_response['status_code']}."
+            )
+
+        return reproduction_result(
+            "REPRODUCED",
+            bug,
+            "The configured invalid HTTP action created a new record "
+            "containing the submitted invalid field values.",
+            expected_behavior,
+            evidence,
+            after_response["status_code"],
+        )
+
+    evidence.append(
+        "No newly persisted record containing the invalid request fields "
+        "was found after the actual HTTP request."
+    )
+
+    return reproduction_result(
+        "NOT_REPRODUCED",
+        bug,
+        "The HTTP action did not create a newly persisted record with the "
+        "submitted invalid field values.",
+        expected_behavior,
+        evidence,
+        after_response["status_code"],
+    )
+
+
 def build_failure_result(
     message,
     technology=None,
@@ -819,6 +1553,78 @@ def requested_bug_matches(bug_title, bug):
     return True
 
 
+def is_level1_bug_definition(bug_definition, bug_report):
+    """Return true only for the existing Node.js Todo bug definitions."""
+
+    level1_bugs = {
+        level1_empty_task_definition()["bug"],
+        "Selected task cannot be moved to Completed Tasks",
+    }
+    definition_name = (
+        bug_definition.get("bug")
+        if isinstance(bug_definition, dict)
+        else None
+    )
+    report_title = (
+        bug_report.get("bug_title")
+        if isinstance(bug_report, dict)
+        else None
+    )
+
+    return definition_name in level1_bugs or report_title in level1_bugs
+
+
+def runtime_configuration(
+    repository_path,
+    repository_context,
+    execution_strategy,
+    bug_definition,
+):
+    component_type = bug_definition.get("component_type")
+    component = component_for_type(
+        repository_context,
+        component_type,
+    ) if component_type else {}
+
+    if component_type == "backend":
+        start_command = execution_strategy.get(
+            "backend_start_command"
+        ) or component.get("start_command")
+        component_path = execution_strategy.get(
+            "backend_path"
+        ) or component.get("path")
+    else:
+        start_command = component.get("start_command")
+        component_path = component.get("path")
+
+    working_directory = repository_path
+
+    if start_command:
+        if isinstance(component_path, str) and component_path.strip():
+            working_directory = os.path.join(
+                repository_path,
+                component_path,
+            )
+    else:
+        start_command = execution_strategy.get("start_command")
+
+    base_url = resolve_base_url(
+        repository_path,
+        repository_context,
+        bug_definition,
+    )
+
+    return {
+        "start_command": start_command,
+        "working_directory": working_directory,
+        "base_url": base_url,
+        "readiness_path": bug_definition.get(
+            "readiness_path",
+            "/",
+        ),
+    }
+
+
 def main():
     print("\n===== BUG REPRODUCTION AGENT =====")
 
@@ -840,10 +1646,14 @@ def main():
                 "repository_context.json must contain a JSON object."
             )
 
-        if os.path.exists(BUG_REPORT_FILE):
-            bug_report = load_json(
-                BUG_REPORT_FILE
-            )
+        bug_report_path = (
+            sys.argv[1]
+            if len(sys.argv) > 1 and sys.argv[1].strip()
+            else os.getenv("BUG_REPORT_FILE", BUG_REPORT_FILE)
+        )
+
+        if os.path.exists(bug_report_path):
+            bug_report = load_json(bug_report_path)
 
         if not isinstance(bug_report, dict):
             bug_report = {}
@@ -883,21 +1693,48 @@ def main():
                 "execution_strategy."
             )
 
-        technology = execution_strategy.get(
-            "technology"
-        )
-
-        start_command = execution_strategy.get(
-            "start_command"
-        )
+        technology = execution_strategy.get("technology")
 
         validation_method = execution_strategy.get(
             "validation_method"
         )
 
+        bug_definition = bug_definition_for_report(bug_report)
+
+        if bug_definition is None:
+            raise ValueError(
+                "No reproduction definition matched the requested bug."
+            )
+
+        runtime = runtime_configuration(
+            repository_path,
+            repository_context,
+            execution_strategy,
+            bug_definition,
+        )
+        start_command = runtime["start_command"]
+        base_url = runtime["base_url"]
+
+        if not is_level1_bug_definition(bug_definition, bug_report):
+            base_url, runtime_environment, endpoint_error = isolate_local_endpoint(
+                repository_path,
+                repository_context,
+                base_url,
+            )
+
+            if endpoint_error:
+                raise ValueError(endpoint_error)
+        else:
+            runtime_environment = {}
+
         if not start_command:
             raise ValueError(
-                "execution_strategy does not contain start_command."
+                "No start command was found for the reproduction component."
+            )
+
+        if not base_url:
+            raise ValueError(
+                "No application base URL was found for the reproduction component."
             )
 
         print(f"Technology: {technology}")
@@ -909,13 +1746,25 @@ def main():
             f"{bug_report.get('bug_title')}"
         )
 
-        if technology != "Node.js":
+        print("\n--- Starting Target Application ---")
+
+        process, start_error = start_application(
+            repository_path,
+            start_command,
+            base_url=base_url,
+            readiness_path=runtime["readiness_path"],
+            working_directory=runtime["working_directory"],
+            environment=runtime_environment,
+        )
+
+        if start_error:
+            print(
+                "Application start failed:"
+            )
+            print(start_error)
 
             result = build_failure_result(
-                (
-                    "The current runtime reproduction strategy "
-                    f"is not implemented for technology: {technology}."
-                ),
+                start_error,
                 technology=technology,
                 bug_title=bug_report.get(
                     "bug_title"
@@ -924,35 +1773,17 @@ def main():
 
         else:
 
-            print("\n--- Starting Target Application ---")
-
-            process, start_error = start_application(
-                repository_path,
-                start_command,
+            print(
+                "Target application started successfully."
             )
 
-            if start_error:
-                print(
-                    "Application start failed:"
-                )
-                print(start_error)
-
-                result = build_failure_result(
-                    start_error,
-                    technology=technology,
-                    bug_title=bug_report.get(
-                        "bug_title"
-                    ),
+            try:
+                is_level1 = is_level1_bug_definition(
+                    bug_definition,
+                    bug_report,
                 )
 
-            else:
-
-                print(
-                    "Target application started successfully."
-                )
-
-                try:
-
+                if is_level1:
                     print(
                         "\n--- Reproducing Bug 1: Empty Task ---"
                     )
@@ -963,6 +1794,7 @@ def main():
                             start_command,
                             validation_method,
                             process,
+                            base_url=base_url,
                         )
                     )
 
@@ -982,6 +1814,7 @@ def main():
                             start_command,
                             validation_method,
                             process,
+                            base_url=base_url,
                         )
                     )
 
@@ -1026,8 +1859,28 @@ def main():
                             "bugs": bugs,
                         }
 
-                finally:
-                    stop_process(process)
+                else:
+                    print(
+                        "\n--- Reproducing Configured HTTP Bug ---"
+                    )
+
+                    generic_result = reproduce_http_bug(
+                        repository_path,
+                        process,
+                        base_url,
+                        bug_definition,
+                    )
+                    result = {
+                        "status": generic_result["status"],
+                        "bugs": [generic_result],
+                    }
+                    print(
+                        "Configured Bug:",
+                        generic_result["status"],
+                    )
+
+            finally:
+                stop_process(process)
 
         final_result = {
             "project": repository_path,

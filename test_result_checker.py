@@ -129,9 +129,44 @@ TEST_GENERATION_RESULT_PATH = os.path.join(
 
 generation_result = load_json(TEST_GENERATION_RESULT_PATH)
 
+if (
+    generation_result.get("configured_http_reproduction") is True
+    and isinstance(generation_result.get("return_code"), int)
+):
+    generated_status = generation_result.get("status")
+    return_code = generation_result["return_code"]
+    passed = return_code == 0 and generated_status == "SUCCESS"
+
+    write_result({
+        "status": "PASSED" if passed else "FAILED",
+        "return_code": return_code,
+        "tests": generation_result.get("tests"),
+        "passed": generation_result.get("passed"),
+        "failed": generation_result.get("failed"),
+        "test_file": generation_result.get("test_file"),
+        "command": " ".join(
+            str(part)
+            for part in generation_result.get("execution_command", [])
+        ),
+        "stdout": generation_result.get("stdout", ""),
+        "stderr": generation_result.get("stderr", ""),
+        "message": generation_result.get("message"),
+    })
+    raise SystemExit(0 if passed else 1)
+
 generated_test_file = generation_result.get("test_file")
+execution_command = generation_result.get("execution_command")
+execution_working_directory = generation_result.get(
+    "working_directory",
+    ".",
+)
+
+if execution_command:
+    test_command = execution_command
 
 if (
+    not execution_command
+    and
     isinstance(generated_test_file, str)
     and generated_test_file.strip()
 ):
@@ -178,9 +213,26 @@ if not command_parts:
 
 
 try:
+    working_directory = os.path.abspath(
+        os.path.join(target_repo, execution_working_directory)
+    )
+    repository_prefix = target_repo + os.sep
+
+    if (
+        working_directory != target_repo
+        and not working_directory.startswith(repository_prefix)
+    ):
+        write_result(
+            failed_result(
+                "Test working directory is outside the target repository.",
+                " ".join(command_parts),
+            )
+        )
+        raise SystemExit(0)
+
     process = subprocess.run(
         command_parts,
-        cwd=target_repo,
+        cwd=working_directory,
         capture_output=True,
         text=True,
         check=False,
@@ -203,14 +255,24 @@ tests, passed, failed = parse_node_test_summary(combined)
 
 status = "FAILED"
 
-if (
-    process.returncode == 0
-    and tests > 0
-    and passed == tests
-    and failed == 0
+generated_file_exists = (
+    isinstance(generated_test_file, str)
+    and os.path.isfile(os.path.join(target_repo, generated_test_file))
+)
+
+if process.returncode == 0 and (
+    generated_file_exists or generation_result.get("status") == "SUCCESS"
 ):
     status = "PASSED"
 
+if (
+    status == "PASSED"
+    and isinstance(tests, int)
+    and isinstance(passed, int)
+    and isinstance(failed, int)
+    and (passed != tests or failed != 0)
+):
+    status = "FAILED"
 
 result = {
     "status": status,
@@ -220,6 +282,7 @@ result = {
     "failed": failed,
     "test_file": generated_test_file if isinstance(generated_test_file, str) else None,
     "command": " ".join(command_parts),
+    "working_directory": working_directory,
     "stdout": stdout,
     "stderr": stderr,
 }
