@@ -638,8 +638,8 @@ The code fixing process should always be based on the diagnosis and affected fil
 * AI Agent concepts: Completed
 * LangChain learning: Completed
 * LangGraph learning/workflows: Completed
-* LangSmith tracing: Completed
-* LangFuse workflow/testing: Completed
+* LangSmith: Environment-based tracing is available to LangChain model calls when configured; main-workflow tracing was not independently verified against LangSmith.
+* LangFuse: Standalone examples exist; the main orchestrator has an optional workflow trace, with remote delivery not verified against live credentials.
 * n8n connectivity testing: Completed
 
 ---
@@ -660,6 +660,32 @@ Possible future improvements include:
 * Human approval before applying code changes
 * More advanced retry and recovery strategies
 * Full external workflow automation using n8n
+
+## Supervisor Demo and Verified Support
+
+Run the offline regression suite from the repository root:
+
+```powershell
+venv\Scripts\python.exe -m pytest tests -q
+```
+
+Run the deterministic Level 3 WebSocket/Lambda demo. It uses a disposable copy, mocked AWS SDK clients, and no live AWS or WebSocket connection:
+
+```powershell
+venv\Scripts\python.exe workflow_orchestrator.py --local-repository .\level3-serverless-app --local-websocket-demo
+```
+
+The demo reproduces the message-retention failure, applies a deterministic fix only in the run directory, reruns backend Jest, and performs frontend build/lint preflight. Run artifacts, the generated report, and the disposable project are saved under `workflow_runs/<run-id>/`.
+
+Groq diagnosis is opt-in and makes a live Groq API request. The demo fails closed if the request or diagnosis validation fails; the existing demo fixer and regression-test generation remain deterministic:
+
+```powershell
+venv\Scripts\python.exe workflow_orchestrator.py --local-repository .\level3-serverless-app --local-websocket-demo --ai-diagnosis
+```
+
+Optional Langfuse workflow tracing is enabled only when requested. Set `WORKFLOW_TRACE_PROVIDER=langfuse` and configure `LANGFUSE_PUBLIC_KEY` and `LANGFUSE_SECRET_KEY` in the local environment or `.env`. Without the opt-in or usable credentials, the workflow runs without tracing. The trace contains workflow stage names/statuses and retry summaries, not prompts or subprocess logs. Automated coverage uses a mocked client; remote trace delivery has not been verified.
+
+Technology strategy branches and command selection exist for Python, Node.js, .NET, Java, React, and Angular. This does not mean every stack has passed a full reproduce/fix/verify cycle: Level 1/2 are existing completed projects, while the verified disposable end-to-end demonstration is the Level 3 Node.js Lambda/WebSocket backend. Other stacks should be considered strategy-supported, not end-to-end certified. A deployed schema or production message-retention requirement is not verified by the local demo.
 
 ---
 

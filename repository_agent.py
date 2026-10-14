@@ -3,7 +3,10 @@ import os
 import re
 import subprocess
 import sys
+from pathlib import Path
 from urllib.parse import urlparse
+
+from workflow_artifacts import resolve_artifact_path
 
 
 IGNORED_DIRS = {
@@ -17,6 +20,9 @@ IGNORED_DIRS = {
     "obj",
     "dist",
     "build",
+    ".serverless",
+    ".vite",
+    "coverage",
 }
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -24,7 +30,7 @@ TARGET_PROJECTS_DIR = os.path.join(
     os.path.dirname(BASE_DIR),
     "target-projects",
 )
-OUTPUT_FILE = os.path.join(BASE_DIR, "repository_context.json")
+OUTPUT_FILE = resolve_artifact_path("repository_context.json", BASE_DIR)
 DEFAULT_REPOSITORY_URL = (
     "https://github.com/"
     "pallegedaramidushanidilrukshika/"
@@ -230,6 +236,56 @@ def detect_project_type(files, repo_path=None):
             "framework": None,
         })
 
+    serverless_configs = [
+        file
+        for file in files
+        if os.path.basename(file).lower() in {"serverless.yml", "serverless.yaml"}
+    ]
+    serverless_text = "\n".join(
+        read_file(repo_path, file).lower()
+        for file in serverless_configs
+    ) if repo_path else ""
+    uses_aws_provider = bool(
+        re.search(r"(?im)^\s*name\s*:\s*aws\s*$", serverless_text)
+    )
+    has_lambda_functions = uses_aws_provider and bool(
+        re.search(r"(?im)^\s*functions\s*:", serverless_text)
+    )
+    runtime_match = re.search(
+        r"(?im)^\s*runtime\s*:\s*([^\s#]+)",
+        serverless_text,
+    )
+    has_websocket_api = bool(
+        re.search(r"(?i)\bwebsocket\s*:", serverless_text)
+        or "@aws-sdk/client-apigatewaymanagementapi" in all_dependencies
+    )
+    has_dynamodb = bool(
+        {"@aws-sdk/client-dynamodb", "@aws-sdk/lib-dynamodb"} & all_dependencies
+        or re.search(r"(?i)aws::dynamodb::table|dynamodb:(?:putitem|getitem|query)", serverless_text)
+    )
+
+    if has_lambda_functions:
+        detected.append({
+            "technology": "AWS Lambda",
+            "language": "JavaScript",
+            "framework": "Serverless Framework",
+            "runtime": runtime_match.group(1) if runtime_match else None,
+        })
+
+    if has_lambda_functions and has_websocket_api:
+        detected.append({
+            "technology": "API Gateway WebSocket",
+            "language": "WebSocket",
+            "framework": "AWS API Gateway",
+        })
+
+    if has_dynamodb:
+        detected.append({
+            "technology": "DynamoDB",
+            "language": "Database",
+            "framework": "AWS DynamoDB",
+        })
+
     if "angular.json" in file_names:
         detected.append({
             "technology": "Angular",
@@ -256,11 +312,39 @@ def command_from_script(manifest, script_name):
     return f"npm run {script_name}" if script_name != "start" else "npm start"
 
 
+def resolve_local_repository_path(repository_path):
+    if not isinstance(repository_path, str) or not repository_path.strip():
+        raise ValueError("Local repository path must be a non-empty path.")
+
+    resolved_path = os.path.abspath(os.path.expanduser(repository_path))
+    if not os.path.isdir(resolved_path):
+        raise ValueError(f"Local repository path is not a directory: {resolved_path}")
+
+    return resolved_path
+
+
 def component_from_manifest(repo_path, files, manifest_path):
     manifest = read_json_file(repo_path, manifest_path)
     dependencies = package_dependencies(manifest)
     directory = os.path.dirname(manifest_path)
     directory_files = files_in_directory(files, directory)
+    normalized_directory = directory.replace("\\", "/").strip("/")
+    for other_manifest in package_manifests(files):
+        if other_manifest == manifest_path:
+            continue
+
+        other_directory = os.path.dirname(other_manifest).replace("\\", "/").strip("/")
+        if other_directory and (
+            not normalized_directory
+            or other_directory.startswith(f"{normalized_directory}/")
+        ):
+            nested_prefix = f"{other_directory}/"
+            directory_files = [
+                file
+                for file in directory_files
+                if not file.replace("\\", "/").startswith(nested_prefix)
+            ]
+
     directory_names = {
         os.path.basename(file).lower()
         for file in directory_files
@@ -270,11 +354,20 @@ def component_from_manifest(repo_path, files, manifest_path):
         file.lower().endswith((".jsx", ".tsx"))
         for file in directory_files
     )
+    has_angular = (
+        "@angular/core" in dependencies
+        or "angular.json" in directory_names
+    )
     has_vite = "vite" in dependencies or any(
         name.startswith("vite.config.")
         for name in directory_names
     )
     has_express = "express" in dependencies
+    has_serverless_config = any(
+        name in {"serverless.yml", "serverless.yaml"}
+        for name in directory_names
+    )
+    has_serverless = "serverless" in dependencies or has_serverless_config
     has_server_entry = bool(
         directory_names & {"index.js", "app.js", "server.js", "main.js"}
     )
@@ -287,10 +380,21 @@ def component_from_manifest(repo_path, files, manifest_path):
             file.lower().endswith(".tsx")
             for file in directory_files
         ) else "JavaScript"
-    elif has_express or has_server_entry or "server" in directory.lower():
+    elif has_angular:
+        component_type = "frontend"
+        technology = "Angular"
+        framework = "Angular"
+        language = "TypeScript"
+    elif has_express or has_server_entry or has_serverless_config or "server" in directory.lower():
         component_type = "backend"
         technology = "Node.js"
-        framework = "Express" if has_express else None
+        framework = (
+            "Express"
+            if has_express
+            else "Serverless Framework"
+            if has_serverless
+            else None
+        )
         language = "TypeScript" if any(
             file.lower().endswith(".ts")
             for file in directory_files
@@ -312,16 +416,29 @@ def component_from_manifest(repo_path, files, manifest_path):
     start_command = command_from_script(manifest, "start")
     if not start_command and component_type == "frontend":
         start_command = command_from_script(manifest, "dev")
-    if not start_command and component_type != "frontend":
+    if not start_command and component_type != "frontend" and not has_serverless:
         main_file = manifest.get("main")
         if isinstance(main_file, str) and main_file.strip():
             start_command = f"node {main_file}"
 
     build_command = command_from_script(manifest, "build")
+    has_jest = "jest" in dependencies
     test_command = command_from_script(manifest, "test") if has_test_script else None
 
+    if has_jest:
+        test_command = [
+            "node",
+            os.path.join("node_modules", "jest", "bin", "jest.js"),
+            "--runInBand",
+        ]
+
     if component_type == "frontend" and not test_command:
-        test_command = command_from_script(manifest, "lint")
+        test_command = (
+            command_from_script(manifest, "test")
+            or "ng test --watch=false"
+            if technology == "Angular"
+            else command_from_script(manifest, "lint")
+        )
 
     package_manager = package_manager_for_path(files, directory)
 
@@ -342,7 +459,13 @@ def component_from_manifest(repo_path, files, manifest_path):
             if component_type == "frontend"
             else "HTTP / CLI"
         ),
-        "test_framework": "Cypress" if "cypress" in dependencies else None,
+        "test_framework": (
+            "Jest"
+            if has_jest
+            else "Cypress"
+            if "cypress" in dependencies
+            else None
+        ),
         "evidence": [manifest_path],
     }
 
@@ -354,6 +477,19 @@ def detect_architecture(repo_path, files, project_types):
         component_from_manifest(repo_path, files, manifest_path)
         for manifest_path in package_manifests(files)
     ]
+    lambda_project = next(
+        (project for project in project_types
+         if project.get("technology") == "AWS Lambda"),
+        None,
+    )
+    if lambda_project:
+        for component in components:
+            if (
+                component.get("type") == "backend"
+                and component.get("framework") == "Serverless Framework"
+            ):
+                component["technology"] = "AWS Lambda"
+                component["runtime"] = lambda_project.get("runtime")
 
     project_file_names = {
         os.path.basename(file).lower()
@@ -435,6 +571,39 @@ def detect_architecture(repo_path, files, project_types):
             "evidence": infrastructure_evidence,
         })
 
+    for technology, component_type, evidence in (
+        (
+            "API Gateway WebSocket",
+            "api",
+            "serverless.yml websocket routes",
+        ),
+        (
+            "DynamoDB",
+            "database",
+            "AWS Serverless configuration or SDK dependencies",
+        ),
+    ):
+        if any(
+            project.get("technology") == technology
+            for project in project_types
+        ):
+            components.append({
+                "name": technology,
+                "type": component_type,
+                "technology": technology,
+                "framework": None,
+                "language": None,
+                "path": None,
+                "package_manager": None,
+                "install_command": None,
+                "start_command": None,
+                "test_command": None,
+                "build_command": None,
+                "validation_method": "Local tests",
+                "test_framework": None,
+                "evidence": [evidence],
+            })
+
     component_types = {component["type"] for component in components}
     if "frontend" in component_types and (
         "backend" in component_types or "database" in component_types
@@ -455,13 +624,26 @@ def detect_architecture(repo_path, files, project_types):
     }
 
 
-def detect_execution_strategy(project_types):
+def detect_execution_strategy(project_types, architecture=None):
     """Select commands based on detected project technology."""
 
     technologies = {
         project["technology"]
         for project in project_types
     }
+    architecture = architecture if isinstance(architecture, dict) else {}
+    components = architecture.get("components", [])
+    components = components if isinstance(components, list) else []
+    frontend_component = next(
+        (component for component in components
+         if isinstance(component, dict) and component.get("type") == "frontend"),
+        {},
+    )
+    backend_component = next(
+        (component for component in components
+         if isinstance(component, dict) and component.get("type") == "backend"),
+        {},
+    )
 
     if (
         "Node.js" in technologies
@@ -488,16 +670,73 @@ def detect_execution_strategy(project_types):
             "test_framework": "Cypress / Jest",
         }
 
-    if "Node.js" in technologies:
+    if {"AWS Lambda", "API Gateway WebSocket"}.issubset(technologies):
+        backend_path = backend_component.get("path") or "."
+        test_command = backend_component.get("test_command")
+        if (
+            isinstance(test_command, list)
+            and len(test_command) >= 2
+            and test_command[0] == "node"
+            and not os.path.isabs(test_command[1])
+        ):
+            test_command = [
+                test_command[0],
+                os.path.join(backend_path, test_command[1]),
+                *test_command[2:],
+            ]
+
         return {
-            "technology": "Node.js",
-            "package_manager": "npm",
-            "install_command": "npm install",
-            "start_command": "node index.js",
-            "test_command": "node --test",
-            "build_command": None,
-            "validation_method": "HTTP",
-            "test_framework": "node:test",
+            "technology": "React/Vite + AWS Serverless",
+            "language": "JavaScript/TypeScript",
+            "frontend": "React",
+            "frontend_framework": "Vite",
+            "frontend_path": frontend_component.get("path"),
+            "frontend_build_command": frontend_component.get("build_command"),
+            "frontend_lint_command": frontend_component.get("test_command"),
+            "backend": "AWS Lambda",
+            "backend_runtime": next(
+                (project.get("runtime") for project in project_types
+                 if project.get("technology") == "AWS Lambda"),
+                None,
+            ),
+            "backend_path": backend_path,
+            "backend_start_command": None,
+            "api_gateway": "WebSocket",
+            "database": "DynamoDB" if "DynamoDB" in technologies else None,
+            "package_manager": backend_component.get("package_manager", "npm"),
+            "install_command": None,
+            "start_command": None,
+            "test_command": test_command,
+            "test_working_directory": ".",
+            "build_command": frontend_component.get("build_command"),
+            "validation_method": "Jest unit tests",
+            "test_framework": backend_component.get("test_framework", "Jest"),
+        }
+
+    if "Angular" in technologies:
+        package_manager = frontend_component.get("package_manager", "npm")
+        return {
+            "technology": "Angular",
+            "package_manager": package_manager,
+            "install_command": frontend_component.get("install_command"),
+            "start_command": frontend_component.get("start_command") or "ng serve",
+            "test_command": frontend_component.get("test_command") or "ng test --watch=false",
+            "build_command": frontend_component.get("build_command") or "ng build",
+            "validation_method": "HTTP / Browser",
+            "test_framework": frontend_component.get("test_framework") or "Jasmine / Karma",
+        }
+
+    if "React" in technologies:
+        package_manager = frontend_component.get("package_manager", "npm")
+        return {
+            "technology": "React",
+            "package_manager": package_manager,
+            "install_command": frontend_component.get("install_command"),
+            "start_command": frontend_component.get("start_command") or "npm start",
+            "test_command": frontend_component.get("test_command") or "npm test -- --watchAll=false",
+            "build_command": frontend_component.get("build_command") or "npm run build",
+            "validation_method": "HTTP / Browser",
+            "test_framework": frontend_component.get("test_framework") or "Jest / React Testing Library",
         }
 
     if "Python" in technologies:
@@ -551,28 +790,16 @@ def detect_execution_strategy(project_types):
             "test_framework": "xUnit / NUnit / MSTest",
         }
 
-    if "Angular" in technologies:
+    if "Node.js" in technologies:
         return {
-            "technology": "Angular",
+            "technology": "Node.js",
             "package_manager": "npm",
             "install_command": "npm install",
-            "start_command": "ng serve",
-            "test_command": "ng test --watch=false",
-            "build_command": "ng build",
-            "validation_method": "HTTP / Browser",
-            "test_framework": "Jasmine / Karma",
-        }
-
-    if "React" in technologies:
-        return {
-            "technology": "React",
-            "package_manager": "npm",
-            "install_command": "npm install",
-            "start_command": "npm start",
-            "test_command": "npm test -- --watchAll=false",
-            "build_command": "npm run build",
-            "validation_method": "HTTP / Browser",
-            "test_framework": "Jest / React Testing Library",
+            "start_command": "node index.js",
+            "test_command": "node --test",
+            "build_command": None,
+            "validation_method": "HTTP",
+            "test_framework": "node:test",
         }
 
     return {
@@ -599,7 +826,7 @@ def read_file(repo_path, relative_path):
         return f"Unable to read file: {error}"
 
 
-def find_important_files(files):
+def find_important_files(files, repo_path=None):
     """Identify files useful for understanding the project."""
 
     important_files = []
@@ -653,6 +880,33 @@ def find_important_files(files):
             ".vue",
         }:
             important_files.append(file)
+
+    if repo_path:
+        for config_file in files:
+            if os.path.basename(config_file).lower() not in {
+                "serverless.yml",
+                "serverless.yaml",
+            }:
+                continue
+
+            config_text = read_file(repo_path, config_file)
+            for handler in re.findall(
+                r"(?im)^\s*handler\s*:\s*([^\s#]+)",
+                config_text,
+            ):
+                module_path = handler.rpartition(".")[0]
+                if "/" not in module_path and "\\" not in module_path:
+                    module_path = module_path.replace(".", os.sep)
+                for extension in (".js", ".ts", ".mjs", ".cjs", ".py"):
+                    handler_file = os.path.normpath(
+                        os.path.join(
+                            os.path.dirname(config_file),
+                            module_path + extension,
+                        )
+                    )
+                    if handler_file in files:
+                        important_files.append(handler_file)
+                        break
 
     return list(dict.fromkeys(important_files))
 
@@ -737,12 +991,15 @@ def clone_repository(repository_url):
 def build_repository_context(repo_path, repository_url):
     files = scan_repository(repo_path)
     project_types = detect_project_type(files, repo_path)
-    important_files = find_important_files(files)
-    execution_strategy = detect_execution_strategy(project_types)
+    important_files = find_important_files(files, repo_path)
     architecture = detect_architecture(
         repo_path,
         files,
         project_types,
+    )
+    execution_strategy = detect_execution_strategy(
+        project_types,
+        architecture,
     )
 
     context = {
@@ -764,10 +1021,17 @@ def build_repository_context(repo_path, repository_url):
 
 
 def main():
-    repository_url = get_repository_url()
+    local_repository_path = os.getenv("LOCAL_REPOSITORY_PATH")
+    repository_url = None
 
     try:
-        repository_path = clone_repository(repository_url)
+        if local_repository_path:
+            repository_path = resolve_local_repository_path(local_repository_path)
+            repository_url = Path(repository_path).as_uri()
+        else:
+            repository_url = get_repository_url()
+            repository_path = clone_repository(repository_url)
+
         context = build_repository_context(
             repository_path,
             repository_url,

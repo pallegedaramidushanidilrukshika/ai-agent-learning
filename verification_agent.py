@@ -2,6 +2,8 @@ import json
 import os
 import sys
 
+from workflow_artifacts import resolve_artifact_path
+
 
 if hasattr(sys.stdout, "reconfigure"):
     sys.stdout.reconfigure(
@@ -11,12 +13,12 @@ if hasattr(sys.stdout, "reconfigure"):
 
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
-CONTEXT_PATH = os.path.join(BASE_DIR, "repository_context.json")
-TEST_RESULT_PATH = os.path.join(BASE_DIR, "test_result.json")
-BUILD_RESULT_PATH = os.path.join(BASE_DIR, "build_result.json")
-VALIDATION_RESULT_PATH = os.path.join(BASE_DIR, "validation_result.json")
-DIAGNOSIS_PATH = os.path.join(BASE_DIR, "diagnosis.json")
-REPORT_PATH = os.path.join(BASE_DIR, "verification_report.json")
+CONTEXT_PATH = resolve_artifact_path("repository_context.json", BASE_DIR)
+TEST_RESULT_PATH = resolve_artifact_path("test_result.json", BASE_DIR)
+BUILD_RESULT_PATH = resolve_artifact_path("build_result.json", BASE_DIR)
+VALIDATION_RESULT_PATH = resolve_artifact_path("validation_result.json", BASE_DIR)
+DIAGNOSIS_PATH = resolve_artifact_path("diagnosis.json", BASE_DIR)
+REPORT_PATH = resolve_artifact_path("verification_report.json", BASE_DIR)
 
 
 def load_json(path):
@@ -88,7 +90,9 @@ component_builds = [
     component for component in components
     if isinstance(component, dict) and component.get("build_command")
 ]
-test_generation = load_json(os.path.join(BASE_DIR, "test_generation_result.json")) or {}
+test_generation = load_json(
+    resolve_artifact_path("test_generation_result.json", BASE_DIR)
+) or {}
 
 reasons = []
 build_result = {}

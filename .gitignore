@@ -3,6 +3,8 @@ venv/
 
 # Environment / secrets
 .env
+.env.*
+!.env.example
 
 # Python cache
 __pycache__/
@@ -29,6 +31,7 @@ build_result.json
 code_fix_result.json
 validation_result.json
 workflow_artifact_archive/
+workflow_runs/
 
 diagnosis.json
 repository_context.json
@@ -36,3 +39,8 @@ test_generation_result.json
 test_result.json
 verification_report.json
 workflow_report.json
+
+level3-serverless-app/node_modules/
+level3-serverless-app/**/node_modules/
+level3-serverless-app/backend/.serverless/
+level3-serverless-app/frontend/dist/

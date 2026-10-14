@@ -1,10 +1,13 @@
 import json
 import os
+import re
 import sys
 
 from dotenv import load_dotenv
 from langchain_groq import ChatGroq
-from groq import Groq
+from groq import APIStatusError, Groq
+
+from workflow_artifacts import resolve_artifact_path
 
 
 # =========================================================
@@ -13,14 +16,14 @@ from groq import Groq
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 
-REPOSITORY_CONTEXT_FILE = os.path.join(
+REPOSITORY_CONTEXT_FILE = resolve_artifact_path(
+    "repository_context.json",
     BASE_DIR,
-    "repository_context.json"
 )
 
-REPRODUCTION_RESULT_FILE = os.path.join(
+REPRODUCTION_RESULT_FILE = resolve_artifact_path(
+    "reproduction_result.json",
     BASE_DIR,
-    "reproduction_result.json"
 )
 
 DEFAULT_BUG_REPORT_FILE = os.path.join(
@@ -33,10 +36,78 @@ BUG_REPORT_PATH = os.getenv(
     DEFAULT_BUG_REPORT_FILE,
 )
 
-OUTPUT_FILE = os.path.join(
+OUTPUT_FILE = resolve_artifact_path(
+    "diagnosis.json",
     BASE_DIR,
-    "diagnosis.json"
 )
+
+MODEL_CALL_RESULT_FILE = resolve_artifact_path(
+    "diagnosis_model_call.json",
+    BASE_DIR,
+)
+DIAGNOSIS_PROMPT_CHAR_LIMIT = 8500
+DIAGNOSIS_MAX_COMPLETION_TOKENS = 1536
+
+
+def sanitized_groq_status_error(error, api_key):
+    if not isinstance(error, APIStatusError):
+        return {}
+
+    status_code = getattr(error, "status_code", None)
+    metadata = {
+        "http_status_code": status_code if isinstance(status_code, int) else None,
+    }
+
+    message = getattr(error, "message", None)
+    if not isinstance(message, str):
+        message = "Groq API request failed."
+
+    message = re.sub(r"[\r\n\t]+", " ", message).strip()
+    if api_key:
+        message = message.replace(api_key, "[REDACTED]")
+    message = re.sub(
+        r"(?i)\bBearer\s+[^\s,;]+",
+        "Bearer [REDACTED]",
+        message,
+    )
+    message = re.sub(
+        r"(?i)\b(?:authorization|x-api-key)\s*[:=]\s*[^,;]+",
+        "[REDACTED_HEADER]",
+        message,
+    )
+    message = re.sub(
+        r"(?i)\b(?:api[_ -]?key|token|secret|password)\s*[:=]\s*[^,;\s]+",
+        "[REDACTED]",
+        message,
+    )
+    message = re.sub(
+        r"\b(?:gsk_|sk-)[A-Za-z0-9_-]{8,}\b",
+        "[REDACTED_KEY]",
+        message,
+    )
+    message = re.sub(
+        r"(?i)\b(?:prompt|request(?:[_ -]?(?:body|data))?|messages?)\s*[:=].*$",
+        "[request data redacted]",
+        message,
+    )
+    message = message[:400] or "Groq API request failed."
+    metadata["provider_error_message"] = message
+    return metadata
+
+
+def write_model_call_result(model_call_result, error=None, api_key=None):
+    if error is not None:
+        model_call_result.update({
+            "succeeded": False,
+            "outcome": "failed",
+            "error_type": type(error).__name__,
+        })
+        model_call_result.update(
+            sanitized_groq_status_error(error, api_key)
+        )
+
+    with open(MODEL_CALL_RESULT_FILE, "w", encoding="utf-8") as file:
+        json.dump(model_call_result, file, indent=2)
 
 
 # =========================================================
@@ -152,158 +223,287 @@ print(
 )
 
 
-def compact_repository_context(context, bug):
-    """Keep diagnosis evidence useful without exceeding model limits."""
+def compact_evidence_text(value, max_chars, prioritize_diagnostics=False):
+    text = value if isinstance(value, str) else str(value)
+    if len(text) <= max_chars:
+        return text
 
-    compact = {
-        key: value
-        for key, value in context.items()
-        if key != "file_contents"
-    }
-    file_contents = context.get("file_contents", {})
+    if not prioritize_diagnostics or max_chars < 160:
+        half = max(1, (max_chars - 32) // 2)
+        return f"{text[:half]}\n[... evidence clipped ...]\n{text[-half:]}"
 
-    if not isinstance(file_contents, dict):
-        compact["file_contents"] = {}
+    lines = text.splitlines()
+    priority_patterns = (
+        (r"expected|received|assert", 10),
+        (r"\b(?:[A-Za-z]:)?[^\s:]+\.(?:py|js|ts|java|cs):\d+", 9),
+        (r"^\s*at\s+", 8),
+        (r"traceback|exception|error|failed|failure", 4),
+        (r"status code|return code", 3),
+    )
+    scored = []
+    for index, line in enumerate(lines):
+        score = sum(
+            weight
+            for pattern, weight in priority_patterns
+            if re.search(pattern, line, re.IGNORECASE)
+        )
+        if score:
+            scored.append((score, index, line))
+
+    selected_by_index = {}
+    used = 0
+    per_line_limit = max(80, max_chars // 3)
+    candidates = sorted(scored, key=lambda item: (-item[0], item[1]))
+    if not candidates:
+        candidates = [(0, 0, lines[0]), (0, len(lines) - 1, lines[-1])]
+
+    for score, index, line in candidates:
+        if index in selected_by_index or max_chars - used <= 24:
+            continue
+        line_limit = min(per_line_limit, max_chars - used - 1)
+        clipped_line = compact_evidence_text(line, line_limit)
+        selected_by_index[index] = clipped_line
+        used += len(clipped_line) + 1
+
+    selected = [selected_by_index[index] for index in sorted(selected_by_index)]
+
+    if not selected:
+        return f"{text[:max_chars - 24]} [... clipped]"
+    compacted = "\n".join(selected)
+    if len(compacted) > max_chars:
+        compacted = compacted[:max_chars - 24] + " [... clipped]"
+    return compacted
+
+
+def compact_json_value(value, max_chars, prioritize_diagnostics=False, depth=0):
+    if max_chars <= 0 or depth > 8:
+        return None
+    if isinstance(value, str):
+        return compact_evidence_text(value, max_chars, prioritize_diagnostics)
+    if value is None or isinstance(value, (bool, int, float)):
+        return value
+
+    if isinstance(value, dict):
+        key_priority = (
+            "bug_title", "status", "expected_behavior", "actual_behavior",
+            "failure_analysis", "root_cause", "error", "errors", "return_code",
+            "test_result", "stderr", "stdout", "traceback", "stack_trace",
+            "command", "evidence", "observed", "attempted", "bugs", "execution_strategy",
+            "architecture", "technology", "framework", "components", "affected_files",
+        )
+        keys = sorted(
+            value,
+            key=lambda key: (
+                key_priority.index(str(key).lower())
+                if str(key).lower() in key_priority
+                else len(key_priority),
+                str(key),
+            ),
+        )
+        compact = {}
+        for key in keys:
+            candidate_size = len(json.dumps(compact, ensure_ascii=False))
+            remaining = max_chars - candidate_size - len(str(key)) - 8
+            if remaining < 32:
+                break
+            per_value_limit = min(remaining, max(96, max_chars // 4))
+            compact_value = compact_json_value(
+                value[key],
+                per_value_limit,
+                prioritize_diagnostics,
+                depth + 1,
+            )
+            compact[str(key)] = compact_value
+            if len(json.dumps(compact, ensure_ascii=False)) > max_chars:
+                compact.pop(str(key), None)
         return compact
 
-    title = str(bug.get("bug_title", "")).lower()
-    preferred_terms = (
-        "record",
-        "route",
-        "server",
-        "connection",
-        "package.json",
-        "index.js",
-        "app.js",
-        "main.js",
-        "readme",
-    )
-    selected = []
+    if isinstance(value, (list, tuple)):
+        values = list(value)
+        if prioritize_diagnostics:
+            values.sort(
+                key=lambda item: -sum(
+                    bool(re.search(pattern, str(item), re.IGNORECASE))
+                    for pattern in (
+                        r"error|exception|failed|failure",
+                        r"expected|received|assert",
+                        r"traceback|\bat\s+",
+                    )
+                )
+            )
+        compact = []
+        for item in values:
+            candidate_size = len(json.dumps(compact, ensure_ascii=False))
+            remaining = max_chars - candidate_size - 4
+            if remaining < 32:
+                break
+            item_limit = min(remaining, max(96, max_chars // 5))
+            candidate = compact_json_value(
+                item,
+                item_limit,
+                prioritize_diagnostics,
+                depth + 1,
+            )
+            compact.append(candidate)
+            if len(json.dumps(compact, ensure_ascii=False)) > max_chars:
+                compact.pop()
+                break
+        return compact
 
+    return compact_evidence_text(value, max_chars, prioritize_diagnostics)
+
+
+def compact_repository_context(context, bug, reproduction=None, max_chars=3600):
+    """Keep architecture and the most relevant source excerpts only."""
+    context = context if isinstance(context, dict) else {}
+    compact = {
+        key: context[key]
+        for key in (
+            "repository_path",
+            "file_count",
+            "project_types",
+            "execution_strategy",
+            "architecture",
+        )
+        if key in context
+    }
+    bug_text = json.dumps(bug, ensure_ascii=False).lower()
+    reproduction_text = json.dumps(reproduction or {}, ensure_ascii=False).lower()
+    signals = bug_text + "\n" + reproduction_text
+    file_contents = context.get("file_contents", {})
+    if not isinstance(file_contents, dict):
+        file_contents = {}
+
+    scored_files = []
     for path, content in file_contents.items():
-        path_text = str(path).lower()
-        score = sum(term in path_text for term in preferred_terms)
+        normalized_path = str(path).replace("\\", "/")
+        basename = normalized_path.rsplit("/", 1)[-1].lower()
+        score = 0
+        if normalized_path.lower() in signals:
+            score += 20
+        score += sum(
+            3
+            for term in (
+                "handler", "controller", "route", "service", "repository",
+                "model", "error", "test", "spec", "serverless", "package.json",
+            )
+            if term in basename or term in normalized_path.lower()
+        )
+        score += min(8, signals.count(basename)) if basename else 0
+        scored_files.append((score, normalized_path, content))
 
-        if "employee" in title and "record" in path_text:
-            score += 3
+    scored_files.sort(key=lambda item: (-item[0], item[1]))
+    relevant_files = [item for item in scored_files if item[0] > 0]
+    if not relevant_files:
+        fallback_terms = (
+            "handler", "controller", "route", "service", "serverless",
+            "app.", "server.", "readme", "package.json",
+        )
+        relevant_files = [
+            item
+            for item in scored_files
+            if any(term in item[1].lower() for term in fallback_terms)
+        ][:5]
 
-        selected.append((score, path, content))
-
-    selected.sort(key=lambda item: (-item[0], str(item[1])))
-
-    compact_contents = {}
-    total_chars = 0
-    max_total_chars = 12000
-    max_file_chars = 4000
-
-    for _, path, content in selected:
+    source_excerpts = {}
+    source_budget = 2200
+    for _score, path, content in relevant_files[:5]:
         if not isinstance(content, str):
             continue
-
-        remaining = max_total_chars - total_chars
-        if remaining <= 0:
+        available = source_budget - sum(len(value) for value in source_excerpts.values())
+        if available <= 0:
             break
+        excerpt_limit = min(850, available)
+        source_excerpts[path] = compact_evidence_text(content, excerpt_limit)
 
-        excerpt = content[:min(max_file_chars, remaining)]
-        compact_contents[path] = excerpt
-        total_chars += len(excerpt)
-
-    compact["file_contents"] = compact_contents
-    compact["diagnosis_context_note"] = (
-        "File contents are bounded excerpts selected from repository "
-        "evidence; use reproduction evidence as the primary runtime signal."
+    compact["important_files"] = [
+        path for _score, path, _content in relevant_files[:12]
+    ]
+    compact["file_contents"] = source_excerpts
+    compact["context_note"] = (
+        "Repository inventory and source excerpts are ranked and bounded; "
+        "reproduction output is the primary runtime evidence."
     )
-    return compact
+    return compact_json_value(compact, max_chars)
 
 
-diagnosis_repository_context = compact_repository_context(
-    repository_context,
-    bug_report,
-)
+def compact_bug_report(bug, max_chars=700):
+    if not isinstance(bug, dict):
+        return compact_json_value(bug, max_chars)
+    prioritized = (
+        "bug_title", "project_type", "description", "bug", "expected_behavior",
+        "actual_behavior", "symptoms", "reproduction", "steps_to_reproduce",
+        "affected_files", "severity",
+    )
+    selected = {key: bug[key] for key in prioritized if key in bug}
+    if not selected:
+        selected = bug
+    return compact_json_value(selected, max_chars, prioritize_diagnostics=True)
 
 
-# =========================================================
-# AI Diagnosis Prompt
-# =========================================================
+def compact_reproduction_result(reproduction, max_chars=2800):
+    return compact_json_value(
+        reproduction,
+        max_chars,
+        prioritize_diagnostics=True,
+    )
 
-prompt = f"""
-You are an AI software bug diagnosis agent.
 
-Your job is to analyze a REAL application bug.
+def build_diagnosis_prompt(bug, reproduction, repository_context):
+    instruction = """You are an AI software bug diagnosis agent. Use the confirmed reproduction as primary evidence and the bounded repository excerpts as supporting evidence. Respect the detected language/framework; do not assume Python. Diagnose all reported symptoms, trace relevant data flow, identify exact affected files, explain the root cause, propose a minimal safe fix, and give a verification plan. Do not modify source or tests. Do not guess when evidence is insufficient. Return only a complete JSON object, no markdown or surrounding prose, using exactly this schema:
+{"bug_title":"string","project_type":"string","failure_analysis":"string","root_cause":"string","affected_files":["string"],"evidence":["string"],"proposed_fix":"string","verification_plan":["string"]}
 
-IMPORTANT RULES:
-
-1. Analyze the repository using the provided repository context.
-2. Analyze the reproduction result as execution evidence.
-3. Do NOT create or modify tests.
-4. Do NOT modify source files.
-5. Do NOT assume the project is Python.
-6. The project may use Node.js, Python, Java, .NET,
-   React, Angular, or another technology.
-7. Respect the detected technology and execution strategy.
-8. If the bug was reproduced, use the observed failure
-   as primary evidence.
-9. If the bug was NOT_REPRODUCED because the current
-   source is already fixed, do NOT claim that the bug
-   was reproduced.
-10. In the NOT_REPRODUCED case, use the reported bug,
-    repository evidence, and current source to identify
-    the most likely original root cause.
-11. Identify the exact affected files.
-12. Explain why the bug occurs.
-13. Propose the minimum safe source-code fix.
-14. Provide a verification plan.
-15. Return ONLY valid JSON.
-16. Do not wrap the JSON in markdown code fences.
-17. Your response MUST contain a complete JSON object.
-18. Never return an empty response.
-19. Do not add explanations before or after the JSON.
-20. Diagnose EVERY reported symptom separately.
-21. Do not assume that the first affected file is the only file
-    responsible for the bug.
-22. If the affected file is a frontend/template file, inspect the
-    related backend routes, controllers, handlers, or data-processing
-    logic before deciding the root cause.
-23. Trace the complete data flow involved in the bug:
-    user action -> request/form submission -> backend route/handler
-    -> data processing -> response/rendering.
-24. For bugs involving multiple behaviors, identify the root cause
-    of each behavior separately.
-25. Do not propose a fix based only on HTML structure if backend
-    behavior or application logic may also be involved.
-26. The proposed fix must address the actual runtime behavior,
-    not only make the source code look structurally correct.
-27. If repository evidence is insufficient to determine the root
-    cause, explicitly state what evidence is missing instead of
-    guessing.
 BUG REPORT:
-{json.dumps(bug_report, indent=2)}
+__BUG_REPORT_JSON__
 
 BUG REPRODUCTION RESULT:
-{json.dumps(reproduction_result, indent=2)}
+__REPRODUCTION_RESULT_JSON__
 
-REPOSITORY CONTEXT:
-{json.dumps(diagnosis_repository_context, indent=2)}
-
-Return exactly this JSON structure:
-
-{{
-    "bug_title": "...",
-    "project_type": "...",
-    "failure_analysis": "...",
-    "root_cause": "...",
-    "affected_files": [
-        "..."
-    ],
-    "evidence": [
-        "..."
-    ],
-    "proposed_fix": "...",
-    "verification_plan": [
-        "..."
-    ]
-}}
+BOUNDED REPOSITORY CONTEXT:
+__REPOSITORY_CONTEXT_JSON__
 """
+    budgets = {"bug": 650, "reproduction": 2600, "context": 3000}
+    for _attempt in range(8):
+        compact_bug = compact_bug_report(bug, budgets["bug"])
+        compact_reproduction = compact_reproduction_result(
+            reproduction,
+            budgets["reproduction"],
+        )
+        compact_context = compact_repository_context(
+            repository_context,
+            bug,
+            reproduction,
+            budgets["context"],
+        )
+        prompt = instruction.replace(
+            "__BUG_REPORT_JSON__",
+            json.dumps(compact_bug, ensure_ascii=False, separators=(",", ":")),
+        ).replace(
+            "__REPRODUCTION_RESULT_JSON__",
+            json.dumps(
+                compact_reproduction,
+                ensure_ascii=False,
+                separators=(",", ":"),
+            ),
+        ).replace(
+            "__REPOSITORY_CONTEXT_JSON__",
+            json.dumps(compact_context, ensure_ascii=False, separators=(",", ":")),
+        )
+        if len(prompt) <= DIAGNOSIS_PROMPT_CHAR_LIMIT:
+            return prompt
+        for name in ("reproduction", "context", "bug"):
+            budgets[name] = max(128, int(budgets[name] * 0.75))
+
+    raise ValueError(
+        "Compacted diagnosis prompt exceeds the configured character budget."
+    )
+
+
+prompt = build_diagnosis_prompt(
+    bug_report,
+    reproduction_result,
+    repository_context,
+)
 
 
 # =========================================================
@@ -314,19 +514,43 @@ print(
     "\nRunning AI diagnosis with Groq..."
 )
 
-response = client.chat.completions.create(
-    model="openai/gpt-oss-20b",
-    messages=[
-        {
-            "role": "user",
-            "content": prompt
-        }
-    ],
-    temperature=0,
-    max_completion_tokens=4096,
-    reasoning_effort="low",
-    include_reasoning=False
-)
+model_call_result = {
+    "attempted": True,
+    "succeeded": False,
+    "provider": "Groq",
+    "model": "openai/gpt-oss-20b",
+    "outcome": "in_progress",
+    "prompt_character_count": len(prompt),
+    "prompt_character_limit": DIAGNOSIS_PROMPT_CHAR_LIMIT,
+    "max_completion_tokens": DIAGNOSIS_MAX_COMPLETION_TOKENS,
+}
+
+write_model_call_result(model_call_result)
+
+try:
+    response = client.chat.completions.create(
+        model="openai/gpt-oss-20b",
+        messages=[
+            {
+                "role": "user",
+                "content": prompt
+            }
+        ],
+        temperature=0,
+        max_completion_tokens=DIAGNOSIS_MAX_COMPLETION_TOKENS,
+        reasoning_effort="low",
+        include_reasoning=False
+    )
+except Exception as error:
+    write_model_call_result(model_call_result, error, GROQ_API_KEY)
+    print("Groq diagnosis request failed; sanitized status metadata was saved.")
+    sys.exit(1)
+else:
+    model_call_result.update({
+        "succeeded": True,
+        "outcome": "succeeded",
+    })
+    write_model_call_result(model_call_result)
 
 message = response.choices[0].message
 

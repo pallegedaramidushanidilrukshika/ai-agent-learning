@@ -1,3 +1,4 @@
+import argparse
 import json
 import os
 import re
@@ -5,7 +6,11 @@ import shlex
 import shutil
 import subprocess
 import sys
+import uuid
 from datetime import datetime
+
+from workflow_artifacts import ARTIFACT_DIR_ENV, resolve_artifact_path
+from local_websocket_demo import run_level3_websocket_demo
 
 
 # ============================================================
@@ -25,37 +30,31 @@ BUG_REPORT_FILE = os.path.join(
     "bug_report.json"
 )
 
-REPOSITORY_CONTEXT_FILE = os.path.join(
+REPOSITORY_CONTEXT_FILE = resolve_artifact_path("repository_context.json", BASE_DIR)
+REPRODUCTION_RESULT_FILE = resolve_artifact_path("reproduction_result.json", BASE_DIR)
+
+DIAGNOSIS_FILE = resolve_artifact_path("diagnosis.json", BASE_DIR)
+
+CODE_FIX_RESULT_FILE = resolve_artifact_path("code_fix_result.json", BASE_DIR)
+
+TEST_GENERATION_RESULT_FILE = resolve_artifact_path(
+    "test_generation_result.json",
     BASE_DIR,
-    "repository_context.json"
 )
 
-REPRODUCTION_RESULT_FILE = os.path.join(
-    BASE_DIR,
-    "reproduction_result.json"
-)
+TEST_RESULT_FILE = resolve_artifact_path("test_result.json", BASE_DIR)
 
-DIAGNOSIS_FILE = os.path.join(
-    BASE_DIR,
-    "diagnosis.json"
-)
+BUILD_RESULT_FILE = resolve_artifact_path("build_result.json", BASE_DIR)
 
-TEST_RESULT_FILE = os.path.join(
-    BASE_DIR,
-    "test_result.json"
-)
+VALIDATION_RESULT_FILE = resolve_artifact_path("validation_result.json", BASE_DIR)
 
-VERIFICATION_REPORT_FILE = os.path.join(
-    BASE_DIR,
-    "verification_report.json"
-)
+VERIFICATION_REPORT_FILE = resolve_artifact_path("verification_report.json", BASE_DIR)
 
-WORKFLOW_REPORT_FILE = os.path.join(
-    BASE_DIR,
-    "workflow_report.json"
-)
+WORKFLOW_REPORT_FILE = resolve_artifact_path("workflow_report.json", BASE_DIR)
 
 ACTIVE_BUG_REPORT_FILE = BUG_REPORT_FILE
+ACTIVE_RUN_ARTIFACT_DIR = None
+CHILD_ENV_OVERRIDES = {}
 
 
 # ============================================================
@@ -69,9 +68,9 @@ STALE_ARTIFACTS = (
     TEST_RESULT_FILE,
     VERIFICATION_REPORT_FILE,
     WORKFLOW_REPORT_FILE,
-    os.path.join(BASE_DIR, "build_result.json"),
-    os.path.join(BASE_DIR, "validation_result.json"),
-    os.path.join(BASE_DIR, "code_fix_result.json"),
+    BUILD_RESULT_FILE,
+    VALIDATION_RESULT_FILE,
+    CODE_FIX_RESULT_FILE,
 )
 
 
@@ -160,6 +159,114 @@ def remove_stale_artifacts():
 # RUN AGENT
 # ============================================================
 
+def create_run_artifact_dir(base_dir=BASE_DIR):
+    runs_dir = os.path.join(base_dir, "workflow_runs")
+    os.makedirs(runs_dir, exist_ok=True)
+
+    run_id = (
+        datetime.now().strftime("%Y%m%d_%H%M%S_%f")
+        + "_"
+        + uuid.uuid4().hex
+    )
+    run_dir = os.path.join(runs_dir, run_id)
+    os.mkdir(run_dir)
+    return run_dir
+
+
+def configure_run_artifact_paths(run_dir=None):
+    global ACTIVE_RUN_ARTIFACT_DIR
+    global REPOSITORY_CONTEXT_FILE
+    global REPRODUCTION_RESULT_FILE
+    global DIAGNOSIS_FILE
+    global CODE_FIX_RESULT_FILE
+    global TEST_GENERATION_RESULT_FILE
+    global TEST_RESULT_FILE
+    global BUILD_RESULT_FILE
+    global VALIDATION_RESULT_FILE
+    global VERIFICATION_REPORT_FILE
+    global WORKFLOW_REPORT_FILE
+
+    ACTIVE_RUN_ARTIFACT_DIR = run_dir
+    REPOSITORY_CONTEXT_FILE = resolve_artifact_path(
+        "repository_context.json", BASE_DIR, run_dir
+    )
+    REPRODUCTION_RESULT_FILE = resolve_artifact_path(
+        "reproduction_result.json", BASE_DIR, run_dir
+    )
+    DIAGNOSIS_FILE = resolve_artifact_path(
+        "diagnosis.json",
+        BASE_DIR,
+        run_dir,
+    )
+    CODE_FIX_RESULT_FILE = resolve_artifact_path(
+        "code_fix_result.json",
+        BASE_DIR,
+        run_dir,
+    )
+    TEST_GENERATION_RESULT_FILE = resolve_artifact_path(
+        "test_generation_result.json", BASE_DIR, run_dir
+    )
+    TEST_RESULT_FILE = resolve_artifact_path("test_result.json", BASE_DIR, run_dir)
+    BUILD_RESULT_FILE = resolve_artifact_path("build_result.json", BASE_DIR, run_dir)
+    VALIDATION_RESULT_FILE = resolve_artifact_path(
+        "validation_result.json", BASE_DIR, run_dir
+    )
+    VERIFICATION_REPORT_FILE = resolve_artifact_path(
+        "verification_report.json", BASE_DIR, run_dir
+    )
+    WORKFLOW_REPORT_FILE = resolve_artifact_path(
+        "workflow_report.json", BASE_DIR, run_dir
+    )
+
+
+def parse_workflow_arguments(argv=None):
+    parser = argparse.ArgumentParser()
+    parser.add_argument("repository_url", nargs="?")
+    parser.add_argument("bug_report", nargs="?")
+    parser.add_argument("--local-repository")
+    parser.add_argument("--validation-only", action="store_true")
+    parser.add_argument("--local-websocket-demo", action="store_true")
+    parser.add_argument("--ai-diagnosis", action="store_true")
+    arguments = parser.parse_args(argv)
+
+    if arguments.local_repository and arguments.repository_url:
+        if arguments.bug_report:
+            parser.error(
+                "Use either positional URL and bug-report arguments, or "
+                "--local-repository with at most one positional bug-report."
+            )
+        arguments.bug_report = arguments.repository_url
+        arguments.repository_url = None
+
+    if arguments.validation_only and not arguments.local_repository:
+        parser.error("--validation-only requires --local-repository PATH.")
+
+    if arguments.local_websocket_demo and not arguments.local_repository:
+        parser.error("--local-websocket-demo requires --local-repository PATH.")
+
+    if arguments.local_websocket_demo and arguments.validation_only:
+        parser.error("Choose either --validation-only or --local-websocket-demo.")
+
+    if arguments.ai_diagnosis and not arguments.local_websocket_demo:
+        parser.error("--ai-diagnosis requires --local-websocket-demo.")
+
+    if arguments.local_websocket_demo and arguments.bug_report:
+        parser.error(
+            "--local-websocket-demo creates its own run-scoped deterministic bug report."
+        )
+
+    if arguments.local_repository:
+        arguments.local_repository = os.path.abspath(
+            os.path.expanduser(arguments.local_repository)
+        )
+        if not os.path.isdir(arguments.local_repository):
+            parser.error(
+                "--local-repository must identify an existing directory."
+            )
+
+    return arguments
+
+
 def run_agent(script_name, arguments=None):
     command = [
         sys.executable,
@@ -173,6 +280,11 @@ def run_agent(script_name, arguments=None):
         f"\nRunning: {' '.join(command)}"
     )
 
+    child_environment = os.environ.copy()
+    child_environment.update(CHILD_ENV_OVERRIDES)
+    if ACTIVE_RUN_ARTIFACT_DIR:
+        child_environment[ARTIFACT_DIR_ENV] = ACTIVE_RUN_ARTIFACT_DIR
+
     try:
         result = subprocess.run(
             command,
@@ -181,6 +293,7 @@ def run_agent(script_name, arguments=None):
             text=True,
             encoding="utf-8",
             errors="backslashreplace",
+            env=child_environment,
         )
     except (OSError, subprocess.SubprocessError, UnicodeError, ValueError) as error:
         return {
@@ -205,6 +318,17 @@ def run_agent(script_name, arguments=None):
         "output": stdout,
         "error": stderr,
     }
+
+
+def run_code_fix_stage():
+    if os.path.exists(CODE_FIX_RESULT_FILE):
+        os.remove(CODE_FIX_RESULT_FILE)
+
+    result = run_agent(
+        AGENTS["code_fix"],
+        [DIAGNOSIS_FILE],
+    )
+    return result, load_json(CODE_FIX_RESULT_FILE)
 
 
 # ============================================================
@@ -501,8 +625,173 @@ def run_component_builds(context):
             "components": results,
         }
 
-    save_json(os.path.join(BASE_DIR, "build_result.json"), aggregate)
+    save_json(BUILD_RESULT_FILE, aggregate)
     return aggregate
+
+
+def run_validation_only(context):
+    repository_path = os.path.realpath(get_repository_path(context) or "")
+    architecture = context.get("architecture", {})
+    components = architecture.get("components", []) if isinstance(architecture, dict) else []
+    frontend = next(
+        (component for component in components
+         if isinstance(component, dict) and component.get("type") == "frontend"),
+        None,
+    )
+    backend = next(
+        (component for component in components
+         if isinstance(component, dict) and component.get("type") == "backend"),
+        None,
+    )
+    command_specs = []
+    setup_errors = []
+
+    if frontend is None:
+        setup_errors.append("No frontend component was detected.")
+    else:
+        if frontend.get("build_command") == "npm run build":
+            command_specs.append(("frontend_build", frontend, ["npm", "run", "build"], "build"))
+        else:
+            setup_errors.append("Frontend npm run build command was not detected.")
+
+        if frontend.get("test_command") == "npm run lint":
+            command_specs.append(("frontend_lint", frontend, ["npm", "run", "lint"], "test"))
+        else:
+            setup_errors.append("Frontend npm run lint command was not detected.")
+
+    if backend is None:
+        setup_errors.append("No backend component was detected.")
+    elif str(backend.get("test_framework") or "").lower() == "jest":
+        jest_command = backend.get("test_command")
+        component_path = backend.get("path") or "."
+        backend_directory = os.path.realpath(
+            os.path.join(repository_path, component_path)
+        )
+        expected_runner = os.path.join("node_modules", "jest", "bin", "jest.js")
+        runner_path = os.path.join(backend_directory, expected_runner)
+        if (
+            isinstance(jest_command, list)
+            and len(jest_command) == 3
+            and jest_command[0] == "node"
+            and os.path.normcase(os.path.normpath(str(jest_command[1])))
+            == os.path.normcase(os.path.normpath(expected_runner))
+            and jest_command[2] == "--runInBand"
+            and os.path.isfile(runner_path)
+        ):
+            command_specs.append((
+                "backend_jest",
+                backend,
+                ["node", expected_runner, "--runInBand"],
+                "test",
+            ))
+        else:
+            setup_errors.append("Installed local Jest runner was not detected.")
+    else:
+        setup_errors.append("Backend Jest test framework was not detected.")
+
+    check_results = []
+    for check_name, component, command, kind in command_specs:
+        component_path = component.get("path") or "."
+        working_directory = os.path.realpath(
+            os.path.join(repository_path, component_path)
+        )
+        try:
+            within_repository = os.path.normcase(
+                os.path.commonpath([repository_path, working_directory])
+            ) == os.path.normcase(repository_path)
+        except ValueError:
+            within_repository = False
+        if not within_repository:
+            check_results.append({
+                "name": check_name,
+                "status": "FAILED",
+                "return_code": 1,
+                "error": "Component working directory is outside the local repository.",
+            })
+            continue
+
+        command_args = command_parts(command)
+        try:
+            process = subprocess.run(
+                command_args,
+                cwd=working_directory,
+                capture_output=True,
+                text=True,
+                check=False,
+                env={**os.environ, "npm_config_offline": "true"},
+            )
+            check_results.append({
+                "name": check_name,
+                "kind": kind,
+                "component": component.get("name"),
+                "path": component_path,
+                "command": command_args,
+                "status": "PASSED" if process.returncode == 0 else "FAILED",
+                "return_code": process.returncode,
+                "stdout": process.stdout or "",
+                "stderr": process.stderr or "",
+            })
+        except (OSError, subprocess.SubprocessError, ValueError) as error:
+            check_results.append({
+                "name": check_name,
+                "kind": kind,
+                "component": component.get("name"),
+                "path": component_path,
+                "command": command_args,
+                "status": "FAILED",
+                "return_code": 1,
+                "error": str(error),
+            })
+
+    for error in setup_errors:
+        check_results.append({
+            "name": "validation_configuration",
+            "status": "FAILED",
+            "return_code": 1,
+            "error": error,
+        })
+
+    build_checks = [item for item in check_results if item.get("kind") == "build"]
+    test_checks = [item for item in check_results if item.get("kind") == "test"]
+    checks_passed = (
+        not setup_errors
+        and len(build_checks) == 1
+        and len(test_checks) == 2
+        and all(item.get("status") == "PASSED" for item in check_results)
+    )
+    return_code = 0 if checks_passed else 1
+    result_status = "PASSED" if checks_passed else "FAILED"
+
+    build_result = {
+        "status": "PASSED" if build_checks and all(item["status"] == "PASSED" for item in build_checks) else "FAILED",
+        "return_code": 0 if build_checks and all(item["status"] == "PASSED" for item in build_checks) else 1,
+        "components": build_checks,
+    }
+    test_result = {
+        "status": "PASSED" if test_checks and all(item["status"] == "PASSED" for item in test_checks) else "FAILED",
+        "return_code": 0 if test_checks and all(item["status"] == "PASSED" for item in test_checks) else 1,
+        "checks": test_checks,
+    }
+    validation_result = {
+        "mode": "validation-only",
+        "status": result_status,
+        "return_code": return_code,
+        "application_started": False,
+        "dependency_installation": False,
+        "aws_accessed": False,
+        "checks": check_results,
+    }
+
+    save_json(BUILD_RESULT_FILE, build_result)
+    save_json(TEST_RESULT_FILE, test_result)
+    save_json(VALIDATION_RESULT_FILE, validation_result)
+    save_json(VERIFICATION_REPORT_FILE, {
+        "status": "NOT_APPLICABLE",
+        "reason": ["Validation-only mode does not reproduce a bug or verify a fix."],
+        "validation_result": validation_result,
+    })
+
+    return validation_result
 
 
 def run_post_fix_runtime_validation(initial_reproduction):
@@ -566,7 +855,7 @@ def run_post_fix_runtime_validation(initial_reproduction):
             else "Runtime validation did not prove the invalid request was rejected without insertion."
         ),
     }
-    save_json(os.path.join(BASE_DIR, "validation_result.json"), validation)
+    save_json(VALIDATION_RESULT_FILE, validation)
     return validation
 
 
@@ -630,9 +919,10 @@ def archive_diagnosis(
     if not os.path.exists(DIAGNOSIS_FILE):
         return None
 
-    archive_path = os.path.join(
+    archive_path = resolve_artifact_path(
+        f"{prefix}_{attempt}.json",
         BASE_DIR,
-        f"{prefix}_{attempt}.json"
+        ACTIVE_RUN_ARTIFACT_DIR,
     )
 
     shutil.copyfile(
@@ -656,9 +946,10 @@ def create_retry_bug_report(
     if not isinstance(original_bug, dict):
         original_bug = {}
 
-    retry_path = os.path.join(
+    retry_path = resolve_artifact_path(
+        f"bug_report_retry_{attempt}.json",
         BASE_DIR,
-        f"bug_report_retry_{attempt}.json"
+        ACTIVE_RUN_ARTIFACT_DIR,
     )
 
     retry_report = {
@@ -678,6 +969,19 @@ def create_retry_bug_report(
     )
 
     return retry_path
+
+
+def load_retry_failure_context():
+    return {
+        "previous_reproduction_result": load_json(REPRODUCTION_RESULT_FILE),
+        "previous_test_generation_result": load_json(TEST_GENERATION_RESULT_FILE),
+        "previous_code_fix_result": load_json(CODE_FIX_RESULT_FILE),
+        "previous_test_result": load_json(TEST_RESULT_FILE),
+        "previous_build_result": load_json(BUILD_RESULT_FILE),
+        "previous_validation_result": load_json(VALIDATION_RESULT_FILE),
+        "previous_verification_result": load_json(VERIFICATION_REPORT_FILE),
+        "previous_diagnosis": load_json(DIAGNOSIS_FILE),
+    }
 
 
 # ============================================================
@@ -761,43 +1065,50 @@ def create_workflow_report(
 # MAIN WORKFLOW
 # ============================================================
 
-def main():
+def _run_workflow():
 
     global ACTIVE_BUG_REPORT_FILE
+    global ACTIVE_RUN_ARTIFACT_DIR
+    global CHILD_ENV_OVERRIDES
 
-    repository_url = (
-        sys.argv[1].strip()
-        if len(sys.argv) > 1 and sys.argv[1].strip()
-        else None
-    )
+    arguments = parse_workflow_arguments()
+    repository_url = arguments.repository_url
+    local_repository_path = arguments.local_repository
     selected_bug_report = (
-        sys.argv[2].strip()
-        if len(sys.argv) > 2 and sys.argv[2].strip()
+        arguments.bug_report
+        if arguments.bug_report and arguments.bug_report.strip()
         else os.getenv("BUG_REPORT_FILE", BUG_REPORT_FILE)
     )
 
-    if repository_url:
-        os.environ["GITHUB_REPOSITORY_URL"] = repository_url
-
     ACTIVE_BUG_REPORT_FILE = selected_bug_report
-    os.environ["BUG_REPORT_FILE"] = selected_bug_report
+    CHILD_ENV_OVERRIDES = {
+        "BUG_REPORT_FILE": selected_bug_report,
+    }
+    if repository_url:
+        CHILD_ENV_OVERRIDES["GITHUB_REPOSITORY_URL"] = repository_url
+    if local_repository_path:
+        CHILD_ENV_OVERRIDES["LOCAL_REPOSITORY_PATH"] = local_repository_path
+    configure_run_artifact_paths(create_run_artifact_dir())
 
     print_header(
         "AI AGENTIC SOFTWARE DEBUGGING WORKFLOW"
     )
-
-    # Remove only generated stale artifacts.
-    remove_stale_artifacts()
 
     stage_results = []
     retry_history = []
 
     workflow_failed = False
     final_status = "FAIL"
+    tests_passed = False
+    builds_passed = False
+    runtime_passed = False
     verification_passed = False
 
     context = {}
     initial_reproduction = None
+    tests_passed = False
+    builds_passed = False
+    runtime_passed = False
 
 
     # ========================================================
@@ -863,6 +1174,162 @@ def main():
         )
 
         workflow_failed = True
+
+
+    if arguments.validation_only:
+        validation_result = run_validation_only(
+            context if isinstance(context, dict) else {}
+        )
+        validation_passed = (
+            result["success"]
+            and context_valid
+            and validation_result["status"] == "PASSED"
+        )
+        final_status = "PASS" if validation_passed else "FAIL"
+        add_stage_result(
+            stage_results,
+            2,
+            "Offline Validation",
+            "SUCCESS" if validation_passed else "FAILED",
+            validation_result,
+        )
+        report = create_workflow_report(
+            stage_results,
+            retry_history,
+            final_status,
+            context if isinstance(context, dict) else {},
+        )
+        return 0 if report["final_status"] == "PASS" else 1
+
+    if arguments.local_websocket_demo:
+        preflight_result = (
+            run_validation_only(context)
+            if result["success"] and context_valid
+            else {
+                "status": "FAILED",
+                "return_code": 1,
+                "checks": [],
+                "error": context_error or "Repository analysis failed.",
+            }
+        )
+        demo_result = run_level3_websocket_demo(
+            context if isinstance(context, dict) else {},
+            ACTIVE_RUN_ARTIFACT_DIR,
+            preflight_validation=preflight_result,
+            diagnosis_mode=(
+                "groq_ai" if arguments.ai_diagnosis else "deterministic"
+            ),
+        )
+        retry_history.extend(
+            {
+                "attempt": attempt.get("attempt"),
+                "test_result": (
+                    "PASS"
+                    if attempt.get("test_result", {}).get("status") == "PASSED"
+                    else "FAIL"
+                ),
+                "verification": "PASS" if attempt.get("verified") else "FAIL",
+                "overall": "PASS" if attempt.get("verified") else "FAIL",
+                "modified_files": attempt.get("fix_result", {}).get("modified_files", []),
+                "semantic_fix_present": attempt.get("semantic_fix_present", False),
+            }
+            for attempt in demo_result.get("attempts", [])
+            if isinstance(attempt, dict)
+        )
+        for demo_stage in demo_result.get("stages", []):
+            add_stage_result(
+                stage_results,
+                demo_stage["stage"],
+                demo_stage["name"],
+                demo_stage["status"],
+                demo_stage.get("details"),
+            )
+        final_status = (
+            "PASS"
+            if (
+                result["success"]
+                and context_valid
+                and preflight_result.get("status") == "PASSED"
+                and demo_result.get("final_status") == "PASS"
+            )
+            else "FAIL"
+        )
+        demo_result["preflight_validation"] = preflight_result
+        demo_result["final_status"] = final_status
+        demo_result["return_code"] = 0 if final_status == "PASS" else 1
+        demo_result["status"] = "PASSED" if final_status == "PASS" else "FAILED"
+        save_json(VALIDATION_RESULT_FILE, demo_result)
+        report = create_workflow_report(
+            stage_results,
+            retry_history,
+            final_status,
+            context if isinstance(context, dict) else {},
+        )
+        report.update({
+            "workflow": "Level 3 Local WebSocket Bug-Fix Demo",
+            "workflow_logic": demo_result.get(
+                "workflow_logic",
+                report.get("workflow_logic", []),
+            ),
+            "diagnosis_mode": demo_result.get("diagnosis_mode", "deterministic"),
+            "model_call": demo_result.get("model_call"),
+            "diagnosis_validation": demo_result.get("diagnosis_validation"),
+            "ai_powered_stages": demo_result.get("ai_powered_stages", []),
+            "code_fix_mode": demo_result.get("code_fix_mode", "deterministic_demo"),
+            "test_generation_mode": demo_result.get(
+                "test_generation_mode",
+                "deterministic_demo",
+            ),
+        })
+        save_json(WORKFLOW_REPORT_FILE, report)
+        print_header("LOCAL WEBSOCKET DEMO RESULT")
+        print(f"FINAL STATUS: {final_status}")
+        print(f"DIAGNOSIS MODE: {demo_result.get('diagnosis_mode', 'deterministic')}")
+        print(
+            "MODEL DIAGNOSIS: "
+            + (
+                "SUCCEEDED"
+                if "diagnosis" in demo_result.get("ai_powered_stages", [])
+                else "NOT USED OR NOT ACCEPTED"
+            )
+        )
+        for demo_stage in demo_result.get("stages", []):
+            print(f"STAGE {demo_stage['stage']}: {demo_stage['status']} - {demo_stage['name']}")
+
+        reproduction_stage = next(
+            (
+                stage
+                for stage in demo_result.get("stages", [])
+                if stage.get("stage") == 2
+            ),
+            {},
+        )
+        baseline_test_result = reproduction_stage.get("details", {}).get("test_result", {})
+        print(
+            "BASELINE TESTS: "
+            f"{baseline_test_result.get('passed', 0)} passed, "
+            f"{baseline_test_result.get('failed', 0)} failed, "
+            f"{baseline_test_result.get('tests', 0)} total"
+        )
+        attempts = demo_result.get("attempts", [])
+        if attempts:
+            final_attempt = attempts[-1]
+            post_fix_result = final_attempt.get("test_result", {})
+            print(
+                "POST-FIX TESTS: "
+                f"{post_fix_result.get('passed', 0)} passed, "
+                f"{post_fix_result.get('failed', 0)} failed, "
+                f"{post_fix_result.get('tests', 0)} total"
+            )
+            print(
+                "FIXED FILES: "
+                + ", ".join(
+                    final_attempt.get("fix_result", {}).get("modified_files", [])
+                )
+            )
+        print(f"RUN ARTIFACTS: {ACTIVE_RUN_ARTIFACT_DIR}")
+        print(f"\nWorkflow Report:\n{WORKFLOW_REPORT_FILE}")
+        return 0 if report["final_status"] == "PASS" else 1
 
 
     # ========================================================
@@ -1029,25 +1496,7 @@ def main():
 
         if attempt > 1:
 
-            failure_context = {
-                "previous_test_result": (
-                    load_json(
-                        TEST_RESULT_FILE
-                    )
-                ),
-
-                "previous_verification_result": (
-                    load_json(
-                        VERIFICATION_REPORT_FILE
-                    )
-                ),
-
-                "previous_diagnosis": (
-                    load_json(
-                        DIAGNOSIS_FILE
-                    )
-                ),
-            }
+            failure_context = load_retry_failure_context()
 
             retry_report = create_retry_bug_report(
                 attempt,
@@ -1109,7 +1558,7 @@ def main():
                 retry_history.append(
                     {
                         "attempt": attempt,
-                        "overall": "FAILED",
+                        "overall": "FAIL",
                         "reason": (
                             "Re-diagnosis failed."
                         ),
@@ -1129,21 +1578,7 @@ def main():
             f"AI Code Fix (Attempt {attempt})"
         )
 
-        code_fix_result_path = os.path.join(
-            BASE_DIR,
-            "code_fix_result.json",
-        )
-        if os.path.exists(code_fix_result_path):
-            os.remove(code_fix_result_path)
-
-        result = run_agent(
-            AGENTS["code_fix"],
-            [DIAGNOSIS_FILE]
-        )
-
-        code_fix_result = load_json(
-            os.path.join(BASE_DIR, "code_fix_result.json")
-        )
+        result, code_fix_result = run_code_fix_stage()
         fix_verified = (
             result["success"]
             and isinstance(code_fix_result, dict)
@@ -1173,7 +1608,7 @@ def main():
             retry_history.append(
                 {
                     "attempt": attempt,
-                    "overall": "FAILED",
+                    "overall": "FAIL",
                     "reason": "Code fix failed.",
                 }
             )
@@ -1228,7 +1663,7 @@ def main():
             retry_history.append(
                 {
                     "attempt": attempt,
-                    "overall": "FAILED",
+                    "overall": "FAIL",
                     "reason": (
                         "Test generation failed."
                     ),
@@ -1516,6 +1951,114 @@ def main():
         if report["final_status"] == "PASS"
         else 1
     )
+
+
+def get_optional_langfuse_client():
+    if os.getenv("WORKFLOW_TRACE_PROVIDER", "").strip().lower() != "langfuse":
+        return None
+
+    try:
+        from dotenv import load_dotenv
+
+        load_dotenv()
+        if not (
+            os.getenv("LANGFUSE_PUBLIC_KEY")
+            and os.getenv("LANGFUSE_SECRET_KEY")
+        ):
+            print("Langfuse tracing unavailable; continuing without tracing.")
+            return None
+
+        from langfuse import get_client
+
+        return get_client()
+    except Exception as error:
+        print(
+            "Langfuse tracing unavailable; continuing without tracing "
+            f"({type(error).__name__})."
+        )
+        return None
+
+
+def run_with_optional_langfuse(workflow_runner, client_factory=None):
+    client = (client_factory or get_optional_langfuse_client)()
+    if client is None:
+        return workflow_runner()
+
+    try:
+        observation_context = client.start_as_current_observation(
+            as_type="agent",
+            name="ai-agentic-debugging-workflow",
+            input={"workflow": "repository-debugging", "mode": "orchestrated"},
+        )
+        observation = observation_context.__enter__()
+    except Exception as error:
+        print(
+            "Langfuse tracing could not start; continuing without tracing "
+            f"({type(error).__name__})."
+        )
+        return workflow_runner()
+
+    try:
+        return_code = workflow_runner()
+    except BaseException as error:
+        try:
+            observation.update(output={
+                "status": "FAILED",
+                "error_type": type(error).__name__,
+            })
+        except Exception:
+            pass
+        try:
+            observation_context.__exit__(type(error), error, error.__traceback__)
+        except Exception:
+            pass
+        try:
+            client.flush()
+        except Exception:
+            pass
+        raise
+
+    report = load_json(WORKFLOW_REPORT_FILE)
+    stages = report.get("stages", []) if isinstance(report, dict) else []
+    retry_history = report.get("retry_history", []) if isinstance(report, dict) else []
+    safe_output = {
+        "status": "PASS" if return_code == 0 else "FAIL",
+        "final_status": report.get("final_status") if isinstance(report, dict) else "FAIL",
+        "stages": [
+            {
+                "stage": stage.get("stage"),
+                "name": stage.get("name"),
+                "status": stage.get("status"),
+            }
+            for stage in stages
+            if isinstance(stage, dict)
+        ],
+        "attempts": [
+            {
+                "attempt": attempt.get("attempt"),
+                "overall": attempt.get("overall"),
+            }
+            for attempt in retry_history
+            if isinstance(attempt, dict)
+        ],
+    }
+    try:
+        observation.update(output=safe_output)
+    except Exception as error:
+        print(f"Langfuse trace update failed ({type(error).__name__}).")
+    try:
+        observation_context.__exit__(None, None, None)
+    except Exception as error:
+        print(f"Langfuse trace close failed ({type(error).__name__}).")
+    try:
+        client.flush()
+    except Exception as error:
+        print(f"Langfuse flush failed ({type(error).__name__}).")
+    return return_code
+
+
+def main():
+    return run_with_optional_langfuse(_run_workflow)
 
 
 # ============================================================

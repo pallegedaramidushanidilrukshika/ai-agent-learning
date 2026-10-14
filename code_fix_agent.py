@@ -10,6 +10,8 @@ from langchain.agents import create_agent
 from langchain_core.tools import tool
 from groq import Groq
 
+from workflow_artifacts import ARTIFACT_DIR_ENV, resolve_artifact_path
+
 
 
 # ---------------------------------------------------------
@@ -46,9 +48,9 @@ if hasattr(sys.stdout, "reconfigure"):
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 
-REPOSITORY_CONTEXT_FILE = os.path.join(
+REPOSITORY_CONTEXT_FILE = resolve_artifact_path(
+    "repository_context.json",
     BASE_DIR,
-    "repository_context.json"
 )
 
 with open(REPOSITORY_CONTEXT_FILE, "r", encoding="utf-8") as f:
@@ -58,9 +60,9 @@ TARGET_REPOSITORY = os.path.abspath(
     repository_context["repository_path"]
 )
 
-CODE_FIX_RESULT_FILE = os.path.join(
-    BASE_DIR,
+CODE_FIX_RESULT_FILE = resolve_artifact_path(
     "code_fix_result.json",
+    BASE_DIR,
 )
 
 ORIGINAL_FILE_CONTENTS = {}
@@ -68,6 +70,11 @@ WRITE_RESULTS = {}
 
 if len(sys.argv) > 1:
     DIAGNOSIS_FILE = sys.argv[1]
+elif os.getenv(ARTIFACT_DIR_ENV):
+    DIAGNOSIS_FILE = resolve_artifact_path(
+        "diagnosis.json",
+        BASE_DIR,
+    )
 else:
     DIAGNOSIS_FILE = "diagnosis.json"
 

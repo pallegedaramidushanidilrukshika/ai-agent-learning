@@ -12,12 +12,14 @@ import urllib.parse
 import urllib.request
 import urllib.error
 
+from workflow_artifacts import resolve_artifact_path
+
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 
-REPOSITORY_CONTEXT_FILE = os.path.join(
-    BASE_DIR,
+REPOSITORY_CONTEXT_FILE = resolve_artifact_path(
     "repository_context.json",
+    BASE_DIR,
 )
 
 BUG_REPORT_FILE = os.path.join(
@@ -25,9 +27,9 @@ BUG_REPORT_FILE = os.path.join(
     "bug_report_level2.json",
 )
 
-REPRODUCTION_RESULT_FILE = os.path.join(
-    BASE_DIR,
+REPRODUCTION_RESULT_FILE = resolve_artifact_path(
     "reproduction_result.json",
+    BASE_DIR,
 )
 
 LEVEL1_BASE_URL = "http://localhost:3000"
@@ -826,7 +828,7 @@ def reproduce_empty_task_bug(
         index_content = read_file(index_file)
         view_content = read_file(view_file)
     except (OSError, UnicodeError) as error:
-        return {
+        return apply_reproduction_contract({
             "status": "NOT_REPRODUCED",
             "bug": "Empty Task can be added",
             "observed_behavior": (
@@ -838,7 +840,7 @@ def reproduce_empty_task_bug(
             ),
             "evidence": [],
             "application_status": None,
-        }
+        }, executed=False, execution_error=True)
 
     normalized_view = normalize_html(view_content)
     normalized_index = normalize_html(index_content)
@@ -859,7 +861,7 @@ def reproduce_empty_task_bug(
         )
 
     if process is None:
-        return {
+        return apply_reproduction_contract({
             "status": "NOT_REPRODUCED",
             "bug": "Empty Task can be added",
             "observed_behavior": (
@@ -872,7 +874,7 @@ def reproduce_empty_task_bug(
             ),
             "evidence": evidence,
             "application_status": None,
-        }
+        }, executed=False, execution_error=True)
 
     before_response = http_request(
         "GET",
@@ -886,7 +888,7 @@ def reproduce_empty_task_bug(
             f"{before_response['error']}"
         )
 
-        return {
+        return apply_reproduction_contract({
             "status": "NOT_REPRODUCED",
             "bug": "Empty Task can be added",
             "observed_behavior": (
@@ -899,7 +901,7 @@ def reproduce_empty_task_bug(
             ),
             "evidence": evidence,
             "application_status": before_response["status_code"],
-        }
+        }, executed=False, execution_error=True)
 
     evidence.append(
         "Initial GET / returned HTTP "
@@ -939,7 +941,7 @@ def reproduce_empty_task_bug(
             f"{after_response['error']}"
         )
 
-        return {
+        return apply_reproduction_contract({
             "status": "NOT_REPRODUCED",
             "bug": "Empty Task can be added",
             "observed_behavior": (
@@ -952,7 +954,18 @@ def reproduce_empty_task_bug(
             ),
             "evidence": evidence,
             "application_status": after_response["status_code"],
-        }
+        },
+            executed=True,
+            evidence_complete=False,
+            execution_error=add_response["status_code"] is None,
+            attempted=[{
+                "method": "POST",
+                "path": "/addtask",
+                "data_fields": ["newtask"],
+                "body_type": "form",
+                "values_redacted": True,
+            }],
+        )
 
     if contains_empty_task(after_response["body"]):
         evidence.append(
@@ -960,7 +973,7 @@ def reproduce_empty_task_bug(
             "detected in the Added Task section."
         )
 
-        return {
+        return apply_reproduction_contract({
             "status": "REPRODUCED",
             "bug": "Empty Task can be added",
             "observed_behavior": (
@@ -973,14 +986,20 @@ def reproduce_empty_task_bug(
             ),
             "evidence": evidence,
             "application_status": after_response["status_code"],
-        }
+        }, executed=True, attempted=[{
+            "method": "POST",
+            "path": "/addtask",
+            "data_fields": ["newtask"],
+            "body_type": "form",
+            "values_redacted": True,
+        }])
 
     evidence.append(
         "No empty task was detected after the actual POST /addtask "
         "request."
     )
 
-    return {
+    return apply_reproduction_contract({
         "status": "NOT_REPRODUCED",
         "bug": "Empty Task can be added",
         "observed_behavior": (
@@ -993,7 +1012,19 @@ def reproduce_empty_task_bug(
         ),
         "evidence": evidence,
         "application_status": after_response["status_code"],
-    }
+    },
+        executed=True,
+        evidence_complete=add_response["status_code"] is not None
+        and add_response["status_code"] < 500,
+        execution_error=add_response["status_code"] is None,
+        attempted=[{
+            "method": "POST",
+            "path": "/addtask",
+            "data_fields": ["newtask"],
+            "body_type": "form",
+            "values_redacted": True,
+        }],
+    )
 
 
 def reproduce_remove_task_bug(
@@ -1032,7 +1063,7 @@ def reproduce_remove_task_bug(
         index_content = read_file(index_file)
         view_content = read_file(view_file)
     except (OSError, UnicodeError) as error:
-        return {
+        return apply_reproduction_contract({
             "status": "NOT_REPRODUCED",
             "bug": "Selected task cannot be moved to Completed Tasks",
             "observed_behavior": (
@@ -1044,7 +1075,7 @@ def reproduce_remove_task_bug(
             ),
             "evidence": [],
             "application_status": None,
-        }
+        }, executed=False, execution_error=True)
 
     normalized_view = normalize_html(view_content)
     normalized_index = normalize_html(index_content)
@@ -1065,7 +1096,7 @@ def reproduce_remove_task_bug(
         )
 
     if process is None:
-        return {
+        return apply_reproduction_contract({
             "status": "NOT_REPRODUCED",
             "bug": "Selected task cannot be moved to Completed Tasks",
             "observed_behavior": (
@@ -1078,7 +1109,7 @@ def reproduce_remove_task_bug(
             ),
             "evidence": evidence,
             "application_status": None,
-        }
+        }, executed=False, execution_error=True)
 
     # Create a unique task so the reproduction does not depend on
     # manually existing tasks.
@@ -1107,7 +1138,7 @@ def reproduce_remove_task_bug(
     )
 
     if not add_response["success"]:
-        return {
+        return apply_reproduction_contract({
             "status": "NOT_REPRODUCED",
             "bug": "Selected task cannot be moved to Completed Tasks",
             "observed_behavior": (
@@ -1119,7 +1150,14 @@ def reproduce_remove_task_bug(
             ),
             "evidence": evidence,
             "application_status": add_response["status_code"],
-        }
+        }, executed=False, execution_error=True, attempted=[{
+            "method": "POST",
+            "path": "/addtask",
+            "data_fields": ["newtask"],
+            "body_type": "form",
+            "purpose": "create_reproduction_task",
+            "values_redacted": True,
+        }])
 
     before_remove = http_request(
         "GET",
@@ -1133,7 +1171,7 @@ def reproduce_remove_task_bug(
             f"{before_remove['error']}"
         )
 
-        return {
+        return apply_reproduction_contract({
             "status": "NOT_REPRODUCED",
             "bug": "Selected task cannot be moved to Completed Tasks",
             "observed_behavior": (
@@ -1146,7 +1184,14 @@ def reproduce_remove_task_bug(
             ),
             "evidence": evidence,
             "application_status": before_remove["status_code"],
-        }
+        }, executed=False, execution_error=True, attempted=[{
+            "method": "POST",
+            "path": "/addtask",
+            "data_fields": ["newtask"],
+            "body_type": "form",
+            "purpose": "create_reproduction_task",
+            "values_redacted": True,
+        }])
 
     if task_present_in_active_list(
         before_remove["body"],
@@ -1194,7 +1239,7 @@ def reproduce_remove_task_bug(
             f"{after_remove['error']}"
         )
 
-        return {
+        return apply_reproduction_contract({
             "status": "NOT_REPRODUCED",
             "bug": "Selected task cannot be moved to Completed Tasks",
             "observed_behavior": (
@@ -1207,7 +1252,28 @@ def reproduce_remove_task_bug(
             ),
             "evidence": evidence,
             "application_status": after_remove["status_code"],
-        }
+        },
+            executed=True,
+            evidence_complete=False,
+            execution_error=remove_response["status_code"] is None,
+            attempted=[
+                {
+                    "method": "POST",
+                    "path": "/addtask",
+                    "data_fields": ["newtask"],
+                    "body_type": "form",
+                    "purpose": "create_reproduction_task",
+                    "values_redacted": True,
+                },
+                {
+                    "method": "POST",
+                    "path": "/removetask",
+                    "data_fields": ["check"],
+                    "body_type": "form",
+                    "values_redacted": True,
+                },
+            ],
+        )
 
     still_active = task_present_in_active_list(
         after_remove["body"],
@@ -1239,7 +1305,7 @@ def reproduce_remove_task_bug(
             "after POST /removetask."
         )
 
-        return {
+        return apply_reproduction_contract({
             "status": "REPRODUCED",
             "bug": "Selected task cannot be moved to Completed Tasks",
             "observed_behavior": (
@@ -1253,13 +1319,35 @@ def reproduce_remove_task_bug(
             ),
             "evidence": evidence,
             "application_status": after_remove["status_code"],
-        }
+        },
+            executed=True,
+            evidence_complete=remove_response["status_code"] is not None
+            and remove_response["status_code"] < 500,
+            execution_error=remove_response["status_code"] is None,
+            attempted=[
+                {
+                    "method": "POST",
+                    "path": "/addtask",
+                    "data_fields": ["newtask"],
+                    "body_type": "form",
+                    "purpose": "create_reproduction_task",
+                    "values_redacted": True,
+                },
+                {
+                    "method": "POST",
+                    "path": "/removetask",
+                    "data_fields": ["check"],
+                    "body_type": "form",
+                    "values_redacted": True,
+                },
+            ],
+        )
 
     evidence.append(
         "The selected task was successfully moved to Completed Tasks."
     )
 
-    return {
+    return apply_reproduction_contract({
         "status": "NOT_REPRODUCED",
         "bug": "Selected task cannot be moved to Completed Tasks",
         "observed_behavior": (
@@ -1272,6 +1360,175 @@ def reproduce_remove_task_bug(
         ),
         "evidence": evidence,
         "application_status": after_remove["status_code"],
+    }, executed=True, attempted=[
+        {
+            "method": "POST",
+            "path": "/addtask",
+            "data_fields": ["newtask"],
+            "body_type": "form",
+            "purpose": "create_reproduction_task",
+            "values_redacted": True,
+        },
+        {
+            "method": "POST",
+            "path": "/removetask",
+            "data_fields": ["check"],
+            "body_type": "form",
+            "values_redacted": True,
+        },
+    ])
+
+
+def classify_reproduction_outcome(
+    executed,
+    bug_observed=False,
+    evidence_complete=True,
+    execution_error=False,
+):
+    if execution_error or not executed:
+        return "EXECUTION_ERROR"
+
+    if not evidence_complete:
+        return "INCONCLUSIVE"
+
+    return "REPRODUCED" if bug_observed else "NOT_REPRODUCED"
+
+
+def sanitize_attempted_evidence(attempted):
+    safe_attempts = []
+    allowed_body_types = {
+        "form",
+        "json",
+        "application/json",
+        "application/x-www-form-urlencoded",
+    }
+    allowed_methods = {"GET", "POST", "PUT", "PATCH", "DELETE", "HEAD", "OPTIONS"}
+    allowed_purposes = {"create_reproduction_task"}
+    allowed_operations = {
+        "start_application",
+        "select_reproduction_strategy",
+        "prepare_reproduction",
+    }
+
+    for item in attempted if isinstance(attempted, (list, tuple)) else []:
+        if not isinstance(item, dict):
+            continue
+
+        safe_item = {}
+        method = item.get("method")
+        if isinstance(method, str) and method.upper() in allowed_methods:
+            safe_item["method"] = method.upper()
+
+        path = item.get("path")
+        if isinstance(path, str):
+            safe_path = urllib.parse.urlsplit(path).path
+            if safe_path:
+                safe_item["path"] = safe_path
+
+        body_type = item.get("body_type")
+        if isinstance(body_type, str) and body_type.lower() in allowed_body_types:
+            safe_item["body_type"] = body_type.lower()
+
+        fields = item.get("data_fields", [])
+        if not isinstance(fields, (list, tuple)):
+            fields = []
+        data = item.get("data")
+        if isinstance(data, dict):
+            fields = [*fields, *data.keys()]
+
+        safe_fields = list(dict.fromkeys(
+            field
+            for field in fields
+            if isinstance(field, str)
+            and re.fullmatch(r"[A-Za-z_][A-Za-z0-9_.-]{0,79}", field)
+        ))
+        if safe_fields:
+            safe_item["data_fields"] = safe_fields
+            safe_item["values_redacted"] = True
+
+        purpose = item.get("purpose")
+        if purpose in allowed_purposes:
+            safe_item["purpose"] = purpose
+
+        operation = item.get("operation")
+        if operation in allowed_operations:
+            safe_item["operation"] = operation
+
+        if isinstance(item.get("executed"), bool):
+            safe_item["executed"] = item["executed"]
+
+        nested_steps = item.get("steps")
+        if isinstance(nested_steps, (list, tuple)):
+            safe_item["steps"] = sanitize_attempted_evidence(nested_steps)
+
+        safe_attempts.append(safe_item)
+
+    return safe_attempts
+
+
+def apply_reproduction_contract(
+    result,
+    executed,
+    evidence_complete=True,
+    execution_error=False,
+    attempted=None,
+):
+    """Set executed when the bug-specific reproduction action was invoked."""
+    result["status"] = classify_reproduction_outcome(
+        executed,
+        bug_observed=result.get("status") == "REPRODUCED",
+        evidence_complete=evidence_complete,
+        execution_error=execution_error,
+    )
+    result["executed"] = bool(executed)
+    result["attempted"] = sanitize_attempted_evidence(attempted)
+    return result
+
+
+def build_structured_evidence(result):
+    bugs = result.get("bugs", [])
+    attempted = []
+    observed = []
+    errors = []
+
+    for bug in bugs:
+        bug_name = bug.get("bug")
+        bug_evidence = bug.get("evidence", [])
+        attempted_steps = sanitize_attempted_evidence(
+            bug.get("attempted", [])
+        )
+
+        if attempted_steps:
+            attempted.append({
+                "executed": bool(bug.get("executed")),
+                "steps": attempted_steps,
+            })
+
+        observed.append({
+            "bug": bug_name,
+            "status": bug.get("status"),
+            "summary": bug.get("observed_behavior"),
+            "application_status": bug.get("application_status"),
+        })
+
+        if bug.get("status") in ("INCONCLUSIVE", "EXECUTION_ERROR"):
+            errors.append({
+                "status": bug.get("status"),
+                "details": bug.get("observed_behavior"),
+            })
+
+    if not bugs and result.get("status") == "EXECUTION_ERROR":
+        message = result.get("observed_behavior")
+        if message:
+            errors.append({
+                "stage": "reproduction_setup",
+                "details": message,
+            })
+
+    return {
+        "attempted": attempted,
+        "observed": observed,
+        "errors": errors,
     }
 
 
@@ -1282,15 +1539,67 @@ def reproduction_result(
     expected_behavior,
     evidence,
     application_status,
+    executed,
+    evidence_complete=True,
+    execution_error=False,
+    attempted=None,
 ):
-    return {
+    return apply_reproduction_contract({
         "status": status,
         "bug": bug,
         "observed_behavior": observed_behavior,
         "expected_behavior": expected_behavior,
         "evidence": evidence,
         "application_status": application_status,
+    }, executed, evidence_complete, execution_error, attempted)
+
+
+def build_final_reproduction_result(project, technology, bug_title, result):
+    bugs = [dict(bug) for bug in result.get("bugs", [])]
+    for bug in bugs:
+        if "attempted" in bug:
+            bug["attempted"] = sanitize_attempted_evidence(bug["attempted"])
+    evidence = result.get("evidence")
+    required_evidence_fields = {"attempted", "observed", "errors"}
+    if (
+        not isinstance(evidence, dict)
+        or not required_evidence_fields.issubset(evidence)
+    ):
+        evidence = build_structured_evidence(result)
+    else:
+        evidence = {
+            "attempted": sanitize_attempted_evidence(evidence["attempted"]),
+            "observed": evidence["observed"],
+            "errors": evidence["errors"],
+        }
+
+    final_result = {
+        "project": project,
+        "technology": technology,
+        "bug_title": bug_title,
+        "status": result.get("status", "EXECUTION_ERROR"),
+        "executed": bool(
+            result.get(
+                "executed",
+                any(bug.get("executed", False) for bug in bugs),
+            )
+        ),
+        "evidence": evidence,
+        "bugs": bugs,
     }
+
+    if not bugs:
+        final_result.update({
+            "observed_behavior": result.get("observed_behavior"),
+            "expected_behavior": result.get("expected_behavior"),
+            "legacy_evidence": result.get(
+                "legacy_evidence",
+                result.get("evidence", []),
+            ),
+            "application_status": result.get("application_status"),
+        })
+
+    return final_result
 
 
 def record_is_empty(record):
@@ -1369,6 +1678,8 @@ def reproduce_http_bug(
             expected_behavior,
             evidence,
             None,
+            executed=False,
+            execution_error=True,
         )
 
     state_check = bug_definition.get("state_check")
@@ -1391,9 +1702,25 @@ def reproduce_http_bug(
             expected_behavior,
             evidence,
             before_response["status_code"],
+            executed=False,
+            execution_error=True,
         )
 
-    before_records = records_from_response(before_response)
+    before_payload = parse_response_body(before_response.get("body", ""))
+    if not isinstance(before_payload, list):
+        evidence.append("Initial state response was not a JSON array.")
+        return reproduction_result(
+            "NOT_REPRODUCED",
+            bug,
+            "The initial state response could not be interpreted.",
+            expected_behavior,
+            evidence,
+            before_response["status_code"],
+            executed=False,
+            evidence_complete=False,
+        )
+
+    before_records = before_payload
     invalid_fields = invalid_fields_from_payload(action.get("data"))
     before_invalid_count = sum(
         1
@@ -1455,9 +1782,45 @@ def reproduce_http_bug(
             expected_behavior,
             evidence,
             after_response["status_code"],
+            executed=True,
+            evidence_complete=False,
+            execution_error=action_response["status_code"] is None,
+            attempted=[{
+                "method": action["method"],
+                "path": action["path"],
+                "data_fields": list(action.get("data", {}))
+                if isinstance(action.get("data"), dict)
+                else [],
+                "body_type": action.get("body_type", "form"),
+                "values_redacted": True,
+            }],
         )
 
-    after_records = records_from_response(after_response)
+    after_payload = parse_response_body(after_response.get("body", ""))
+    if not isinstance(after_payload, list):
+        evidence.append("Final state response was not a JSON array.")
+        return reproduction_result(
+            "NOT_REPRODUCED",
+            bug,
+            "The action was submitted, but the final state response could not be interpreted.",
+            expected_behavior,
+            evidence,
+            after_response["status_code"],
+            executed=True,
+            evidence_complete=False,
+            execution_error=action_response["status_code"] is None,
+            attempted=[{
+                "method": action["method"],
+                "path": action["path"],
+                "data_fields": list(action.get("data", {}))
+                if isinstance(action.get("data"), dict)
+                else [],
+                "body_type": action.get("body_type", "form"),
+                "values_redacted": True,
+            }],
+        )
+
+    after_records = after_payload
     after_invalid_records = [
         record
         for record in after_records
@@ -1504,6 +1867,16 @@ def reproduce_http_bug(
             expected_behavior,
             evidence,
             after_response["status_code"],
+            executed=True,
+            attempted=[{
+                "method": action["method"],
+                "path": action["path"],
+                "data_fields": list(action.get("data", {}))
+                if isinstance(action.get("data"), dict)
+                else [],
+                "body_type": action.get("body_type", "form"),
+                "values_redacted": True,
+            }],
         )
 
     evidence.append(
@@ -1519,6 +1892,21 @@ def reproduce_http_bug(
         expected_behavior,
         evidence,
         after_response["status_code"],
+        executed=True,
+        evidence_complete=(
+            action_response["status_code"] is not None
+            and action_response["status_code"] < 500
+        ),
+        execution_error=action_response["status_code"] is None,
+        attempted=[{
+            "method": action["method"],
+            "path": action["path"],
+            "data_fields": list(action.get("data", {}))
+            if isinstance(action.get("data"), dict)
+            else [],
+            "body_type": action.get("body_type", "form"),
+            "values_redacted": True,
+        }],
     )
 
 
@@ -1526,18 +1914,51 @@ def build_failure_result(
     message,
     technology=None,
     bug_title=None,
+    attempted=None,
 ):
     return {
         "project": None,
         "technology": technology,
         "bug_title": bug_title,
-        "status": "NOT_REPRODUCED",
+        "status": "EXECUTION_ERROR",
+        "executed": False,
         "observed_behavior": message,
         "expected_behavior": None,
-        "evidence": [message],
+        "evidence": {
+            "attempted": sanitize_attempted_evidence(attempted),
+            "observed": [],
+            "errors": [{
+                "stage": "reproduction_setup",
+                "details": message,
+            }],
+        },
+        "legacy_evidence": [message],
         "application_status": None,
         "bugs": [],
     }
+
+
+def aggregate_reproduction_results(bugs):
+    statuses = [bug.get("status") for bug in bugs]
+
+    if not statuses:
+        status = "EXECUTION_ERROR"
+    elif all(status == "REPRODUCED" for status in statuses):
+        status = "REPRODUCED"
+    elif all(status == "NOT_REPRODUCED" for status in statuses):
+        status = "NOT_REPRODUCED"
+    elif all(status == "EXECUTION_ERROR" for status in statuses):
+        status = "EXECUTION_ERROR"
+    else:
+        status = "INCONCLUSIVE"
+
+    result = {
+        "status": status,
+        "executed": any(bug.get("executed", False) for bug in bugs),
+        "bugs": bugs,
+    }
+    result["evidence"] = build_structured_evidence(result)
+    return result
 
 
 def requested_bug_matches(bug_title, bug):
@@ -1769,6 +2190,11 @@ def main():
                 bug_title=bug_report.get(
                     "bug_title"
                 ),
+                attempted=[{
+                    "operation": "start_application",
+                    "command": start_command,
+                    "base_url": base_url,
+                }],
             )
 
         else:
@@ -1841,23 +2267,13 @@ def main():
                             "No reproduction strategy matched the requested bug.",
                             technology=technology,
                             bug_title=requested_bug_title,
+                            attempted=[{
+                                "operation": "select_reproduction_strategy",
+                                "bug_title": requested_bug_title,
+                            }],
                         )
                     else:
-                        reproduced_count = sum(
-                             1
-                             for bug in bugs
-                            if bug.get("status") == "REPRODUCED"
-                        )
-
-                        if reproduced_count == len(bugs):
-                            overall_status = "REPRODUCED"
-                        else:
-                            overall_status = "NOT_REPRODUCED"
-
-                        result = {
-                            "status": overall_status,
-                            "bugs": bugs,
-                        }
+                        result = aggregate_reproduction_results(bugs)
 
                 else:
                     print(
@@ -1872,8 +2288,10 @@ def main():
                     )
                     result = {
                         "status": generic_result["status"],
+                        "executed": generic_result["executed"],
                         "bugs": [generic_result],
                     }
+                    result["evidence"] = build_structured_evidence(result)
                     print(
                         "Configured Bug:",
                         generic_result["status"],
@@ -1882,43 +2300,20 @@ def main():
             finally:
                 stop_process(process)
 
-        final_result = {
-            "project": repository_path,
-            "technology": technology,
-            "bug_title": bug_report.get(
-                "bug_title"
-            ),
-            "status": result.get(
-                "status",
-                "NOT_REPRODUCED",
-            ),
-            "bugs": result.get(
-                "bugs",
-                [],
-            ),
-        }
-
-        if not final_result["bugs"]:
-
-            final_result.update({
-                "observed_behavior": result.get(
-                    "observed_behavior"
-                ),
-                "expected_behavior": result.get(
-                    "expected_behavior"
-                ),
-                "evidence": result.get(
-                    "evidence",
-                    [],
-                ),
-                "application_status": result.get(
-                    "application_status"
-                ),
-            })
+        final_result = build_final_reproduction_result(
+            repository_path,
+            technology,
+            bug_report.get("bug_title"),
+            result,
+        )
 
     except (
         OSError,
+        UnicodeError,
         ValueError,
+        KeyError,
+        TypeError,
+        subprocess.SubprocessError,
         json.JSONDecodeError,
     ) as error:
 
@@ -1948,6 +2343,9 @@ def main():
             bug_title=bug_report.get(
                 "bug_title"
             ),
+            attempted=[{
+                "operation": "prepare_reproduction",
+            }],
         )
 
     with open(
