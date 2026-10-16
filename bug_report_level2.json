@@ -1,0 +1,26 @@
+{
+  "bug_id": "BUG-L2-001",
+  "bug_title": "Employee creation accepts empty required fields",
+  "description": "Submitting the Create Employee form with empty Name, Position, and Level creates a blank employee record.",
+  "expected_behavior": "The request must be rejected and no blank employee record should be created.",
+  "actual_behavior": "A blank employee record is accepted and appears in the employee list.",
+  "severity": "High",
+  "reproduction": {
+    "component_type": "backend",
+    "readiness_path": "/record",
+    "action": {
+      "method": "POST",
+      "path": "/record",
+      "data": {
+        "name": "",
+        "position": "",
+        "level": ""
+      },
+      "body_type": "json"
+    },
+    "state_check": {
+      "method": "GET",
+      "path": "/record"
+    }
+  }
+}

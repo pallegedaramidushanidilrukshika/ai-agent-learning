@@ -1,0 +1,60 @@
+service: level3-serverless-backend
+
+provider:
+  name: aws
+  runtime: nodejs22.x
+  region: ap-southeast-2
+
+  environment:
+    TABLE_NAME:
+      Ref: MessagesTable
+
+functions:
+  connect:
+    handler: src/websocket.connect
+    events:
+      - websocket:
+          route: $connect
+
+  disconnect:
+    handler: src/websocket.disconnect
+    events:
+      - websocket:
+          route: $disconnect
+
+  message:
+    handler: src/websocket.message
+    iam:
+      role:
+        statements:
+          - Effect: Allow
+            Action:
+              - execute-api:ManageConnections
+            Resource:
+              - Fn::Sub: arn:${AWS::Partition}:execute-api:${AWS::Region}:${AWS::AccountId}:${WebsocketsApi}/${sls:stage}/POST/@connections/*
+          - Effect: Allow
+            Action:
+              - dynamodb:PutItem
+            Resource:
+              - Fn::GetAtt:
+                  - MessagesTable
+                  - Arn
+    events:
+      - websocket:
+          route: message
+
+resources:
+  Resources:
+    MessagesTable:
+      Type: AWS::DynamoDB::Table
+      Properties:
+        TableName: level3-messages
+        BillingMode: PAY_PER_REQUEST
+        AttributeDefinitions:
+          - AttributeName: connectionId
+            AttributeType: S
+        KeySchema:
+          - AttributeName: connectionId
+            KeyType: HASH
+plugins:
+  - serverless-offline
