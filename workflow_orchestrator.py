@@ -32,6 +32,7 @@ BUG_REPORT_FILE = os.path.join(
 
 REPOSITORY_CONTEXT_FILE = resolve_artifact_path("repository_context.json", BASE_DIR)
 REPRODUCTION_RESULT_FILE = resolve_artifact_path("reproduction_result.json", BASE_DIR)
+MANUAL_REPRODUCTION_FILE = resolve_artifact_path("manual_reproduction.json", BASE_DIR)
 
 DIAGNOSIS_FILE = resolve_artifact_path("diagnosis.json", BASE_DIR)
 
@@ -112,7 +113,7 @@ def load_json(path):
     try:
         with open(path, "r", encoding="utf-8") as file:
             return json.load(file)
-    except (OSError, json.JSONDecodeError):
+    except (OSError, UnicodeError, json.JSONDecodeError):
         return None
 
 
@@ -177,6 +178,7 @@ def configure_run_artifact_paths(run_dir=None):
     global ACTIVE_RUN_ARTIFACT_DIR
     global REPOSITORY_CONTEXT_FILE
     global REPRODUCTION_RESULT_FILE
+    global MANUAL_REPRODUCTION_FILE
     global DIAGNOSIS_FILE
     global CODE_FIX_RESULT_FILE
     global TEST_GENERATION_RESULT_FILE
@@ -192,6 +194,9 @@ def configure_run_artifact_paths(run_dir=None):
     )
     REPRODUCTION_RESULT_FILE = resolve_artifact_path(
         "reproduction_result.json", BASE_DIR, run_dir
+    )
+    MANUAL_REPRODUCTION_FILE = resolve_artifact_path(
+        "manual_reproduction.json", BASE_DIR, run_dir
     )
     DIAGNOSIS_FILE = resolve_artifact_path(
         "diagnosis.json",
@@ -320,6 +325,16 @@ def run_agent(script_name, arguments=None):
     }
 
 
+def diagnosis_failure_reason(result, fallback):
+    if not isinstance(result, dict):
+        return fallback
+
+    error = result.get("error")
+    if isinstance(error, str) and error.strip():
+        return f"{fallback} Details: {error.strip()[-2000:]}"
+    return fallback
+
+
 def run_code_fix_stage():
     if os.path.exists(CODE_FIX_RESULT_FILE):
         os.remove(CODE_FIX_RESULT_FILE)
@@ -441,6 +456,149 @@ def validate_reproduction():
         isinstance(result, dict)
         and result.get("status") == "REPRODUCED"
     )
+
+
+def validate_manual_reproduction():
+    manual = load_json(MANUAL_REPRODUCTION_FILE)
+    if not isinstance(manual, dict):
+        return False
+
+    steps = manual.get("steps")
+    supporting_evidence = manual.get("supporting_evidence", [])
+    return (
+        manual.get("status") == "MANUAL_SUBMITTED"
+        and manual.get("source") == "user"
+        and isinstance(steps, list)
+        and bool(steps)
+        and all(isinstance(step, str) and step.strip() for step in steps)
+        and isinstance(manual.get("expected_behavior"), str)
+        and bool(manual["expected_behavior"].strip())
+        and isinstance(manual.get("observed_behavior"), str)
+        and bool(manual["observed_behavior"].strip())
+        and isinstance(supporting_evidence, list)
+        and all(isinstance(item, str) for item in supporting_evidence)
+    )
+
+
+def collect_manual_reproduction(reproduction):
+    try:
+        interactive = sys.stdin.isatty()
+    except (AttributeError, OSError):
+        interactive = False
+
+    if not interactive:
+        return {
+            "status": "NOT_OFFERED",
+            "reason": "Manual reproduction requires an interactive terminal.",
+        }
+
+    def cancelled():
+        return {
+            "status": "CANCELLED",
+            "reason": "The user cancelled manual reproduction.",
+        }
+
+    try:
+        response = input(
+            "Automatic reproduction failed. Submit manual reproduction details? [y/N]: "
+        ).strip().lower()
+        if response not in ("y", "yes"):
+            return cancelled()
+
+        steps = []
+        while True:
+            step = input(
+                f"Reproduction step {len(steps) + 1} "
+                "(blank to finish, 'cancel' to stop): "
+            ).strip()
+            if step.lower() == "cancel":
+                return cancelled()
+            if not step:
+                break
+            steps.append(step)
+
+        expected_behavior = input(
+            "Expected behavior ('cancel' to stop): "
+        ).strip()
+        if expected_behavior.lower() == "cancel":
+            return cancelled()
+
+        observed_behavior = input(
+            "Observed behavior ('cancel' to stop): "
+        ).strip()
+        if observed_behavior.lower() == "cancel":
+            return cancelled()
+
+        supporting_evidence = []
+        while True:
+            evidence_line = input(
+                "Supporting evidence, such as errors or logs "
+                "(optional; blank to finish, 'cancel' to stop): "
+            ).rstrip()
+            if evidence_line.strip().lower() == "cancel":
+                return cancelled()
+            if not evidence_line.strip():
+                break
+            supporting_evidence.append(evidence_line)
+    except (EOFError, KeyboardInterrupt):
+        return cancelled()
+
+    missing_fields = []
+    if not steps:
+        missing_fields.append("reproduction_steps")
+    if not expected_behavior:
+        missing_fields.append("expected_behavior")
+    if not observed_behavior:
+        missing_fields.append("observed_behavior")
+    if missing_fields:
+        return {
+            "status": "INSUFFICIENT",
+            "missing_fields": missing_fields,
+            "reason": "Required manual reproduction information is missing.",
+        }
+
+    artifact_path = resolve_artifact_path(
+        "manual_reproduction.json", BASE_DIR, ACTIVE_RUN_ARTIFACT_DIR
+    )
+    submission = {
+        "status": "MANUAL_SUBMITTED",
+        "source": "user",
+        "automatic_reproduction_status": (
+            reproduction.get("status")
+            if isinstance(reproduction, dict)
+            else None
+        ),
+        "steps": steps,
+        "expected_behavior": expected_behavior,
+        "observed_behavior": observed_behavior,
+        "supporting_evidence": supporting_evidence,
+    }
+
+    try:
+        with open(artifact_path, "x", encoding="utf-8") as file:
+            json.dump(submission, file, indent=4, ensure_ascii=False)
+    except FileExistsError:
+        return {
+            "status": "ARTIFACT_CONFLICT",
+            "artifact_path": artifact_path,
+            "reason": "Manual reproduction artifact already exists; it was not overwritten.",
+        }
+    except OSError as error:
+        return {
+            "status": "SAVE_FAILED",
+            "reason": f"Manual reproduction could not be saved: {error}",
+        }
+
+    return {
+        "status": "CAPTURED",
+        "artifact_path": artifact_path,
+        "reason": (
+            "Manual reproduction evidence was captured and validated. "
+            "The workflow can continue to diagnosis using the user-provided "
+            "reproduction steps and supporting evidence."
+        ),
+    }
+
 
 
 # ============================================================
@@ -974,6 +1132,7 @@ def create_retry_bug_report(
 def load_retry_failure_context():
     return {
         "previous_reproduction_result": load_json(REPRODUCTION_RESULT_FILE),
+        "manual_reproduction": load_json(MANUAL_REPRODUCTION_FILE),
         "previous_test_generation_result": load_json(TEST_GENERATION_RESULT_FILE),
         "previous_code_fix_result": load_json(CODE_FIX_RESULT_FILE),
         "previous_test_result": load_json(TEST_RESULT_FILE),
@@ -993,6 +1152,7 @@ def create_workflow_report(
     retry_history,
     final_status,
     context,
+    reproduction_source=None,
 ):
     strategy = get_strategy(context)
 
@@ -1053,6 +1213,30 @@ def create_workflow_report(
         "final_status": final_status,
     }
 
+    if reproduction_source:
+        manual_reproduction = load_json(MANUAL_REPRODUCTION_FILE)
+        report["reproduction_source"] = reproduction_source
+        report["reproduction_evidence"] = {
+            "automatic_result_ref": os.path.relpath(
+                REPRODUCTION_RESULT_FILE,
+                ACTIVE_RUN_ARTIFACT_DIR or BASE_DIR,
+            ),
+            "manual_report_ref": (
+                os.path.relpath(
+                    MANUAL_REPRODUCTION_FILE,
+                    ACTIVE_RUN_ARTIFACT_DIR or BASE_DIR,
+                )
+                if reproduction_source == "manual"
+                else None
+            ),
+            "manual_supporting_evidence": (
+                manual_reproduction.get("supporting_evidence", [])
+                if reproduction_source == "manual"
+                and isinstance(manual_reproduction, dict)
+                else []
+            ),
+        }
+
     save_json(
         WORKFLOW_REPORT_FILE,
         report
@@ -1106,6 +1290,7 @@ def _run_workflow():
 
     context = {}
     initial_reproduction = None
+    reproduction_source = None
     tests_passed = False
     builds_passed = False
     runtime_passed = False
@@ -1352,10 +1537,9 @@ def _run_workflow():
         )
         initial_reproduction = reproduction
 
-        if (
-            result["success"]
-            and validate_reproduction()
-        ):
+        automatic_reproduction_confirmed = validate_reproduction()
+        if result["success"] and automatic_reproduction_confirmed:
+            reproduction_source = "automatic"
 
             add_stage_result(
                 stage_results,
@@ -1365,32 +1549,74 @@ def _run_workflow():
                 reproduction,
             )
 
-        else:
-
+        elif automatic_reproduction_confirmed:
+            reproduction_source = "unresolved_conflict"
             add_stage_result(
                 stage_results,
                 2,
                 "Bug Reproduction",
                 "FAILED",
                 {
-                    "status": (
-                        reproduction.get("status")
-                        if isinstance(
-                            reproduction,
-                            dict
-                        )
-                        else None
-                    ),
-
+                    "status": reproduction.get("status"),
+                    "return_code": result.get("return_code"),
                     "reason": (
-                        "Bug reproduction did not "
-                        "return REPRODUCED. "
-                        "The workflow will not continue."
+                        "The reproduction agent failed, but its artifact reports "
+                        "REPRODUCED. The contradiction must be resolved before "
+                        "manual fallback or diagnosis can continue."
                     ),
                 },
             )
-
             workflow_failed = True
+
+        else:
+            manual_fallback = collect_manual_reproduction(reproduction)
+            manual_context_valid = (
+                manual_fallback["status"] == "CAPTURED"
+                and validate_manual_reproduction()
+            )
+            if manual_context_valid:
+                reproduction_source = "manual"
+                add_stage_result(
+                    stage_results,
+                    2,
+                    "Bug Reproduction",
+                    "MANUAL_CAPTURED",
+                    {
+                        "status": (
+                            reproduction.get("status")
+                            if isinstance(reproduction, dict)
+                            else None
+                        ),
+                        "reason": manual_fallback["reason"],
+                        "manual_fallback": manual_fallback,
+                    },
+                )
+            else:
+                if manual_fallback["status"] == "CAPTURED":
+                    manual_fallback = {
+                        "status": "INSUFFICIENT",
+                        "reason": "Saved manual reproduction did not pass validation.",
+                    }
+                failure_reason = manual_fallback.get(
+                    "reason",
+                    "Bug reproduction did not return REPRODUCED. The workflow will not continue.",
+                )
+                add_stage_result(
+                    stage_results,
+                    2,
+                    "Bug Reproduction",
+                    "FAILED",
+                    {
+                        "status": (
+                            reproduction.get("status")
+                            if isinstance(reproduction, dict)
+                            else None
+                        ),
+                        "reason": failure_reason,
+                        "manual_fallback": manual_fallback,
+                    },
+                )
+                workflow_failed = True
 
 
     # ========================================================
@@ -1411,8 +1637,14 @@ def _run_workflow():
                 DIAGNOSIS_FILE
             )
 
+        diagnosis_arguments = (
+            ["--manual-reproduction", MANUAL_REPRODUCTION_FILE]
+            if reproduction_source == "manual"
+            else None
+        )
         result = run_agent(
-            AGENTS["bug_diagnosis"]
+            AGENTS["bug_diagnosis"],
+            diagnosis_arguments,
         )
 
         diagnosis_available = (
@@ -1462,9 +1694,9 @@ def _run_workflow():
                 "AI Failure Analysis & Root Cause Identification",
                 "FAILED",
                 {
-                    "reason": (
-                        "AI diagnosis failed "
-                        "or was invalid."
+                    "reason": diagnosis_failure_reason(
+                        result,
+                        "AI diagnosis failed or was invalid.",
                     )
                 },
             )
@@ -1515,9 +1747,15 @@ def _run_workflow():
                 f"AI Re-Diagnosis (Attempt {attempt})"
             )
 
+            diagnosis_arguments = [retry_report]
+            if reproduction_source == "manual":
+                diagnosis_arguments.extend([
+                    "--manual-reproduction",
+                    MANUAL_REPRODUCTION_FILE,
+                ])
             result = run_agent(
                 AGENTS["bug_diagnosis"],
-                [retry_report]
+                diagnosis_arguments,
             )
 
             if (
@@ -1548,9 +1786,9 @@ def _run_workflow():
                     f"AI Re-Diagnosis (Attempt {attempt})",
                     "FAILED",
                     {
-                        "reason": (
-                            "Re-diagnosis failed "
-                            "or was invalid."
+                        "reason": diagnosis_failure_reason(
+                            result,
+                            "Re-diagnosis failed or was invalid.",
                         )
                     },
                 )
@@ -1559,8 +1797,9 @@ def _run_workflow():
                     {
                         "attempt": attempt,
                         "overall": "FAIL",
-                        "reason": (
-                            "Re-diagnosis failed."
+                        "reason": diagnosis_failure_reason(
+                            result,
+                            "Re-diagnosis failed.",
                         ),
                     }
                 )
@@ -1939,6 +2178,7 @@ def _run_workflow():
         retry_history,
         final_status,
         context if isinstance(context, dict) else {},
+        reproduction_source,
     )
 
     print(

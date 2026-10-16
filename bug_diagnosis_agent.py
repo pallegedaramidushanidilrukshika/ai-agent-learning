@@ -1,3 +1,4 @@
+import argparse
 import json
 import os
 import re
@@ -47,6 +48,88 @@ MODEL_CALL_RESULT_FILE = resolve_artifact_path(
 )
 DIAGNOSIS_PROMPT_CHAR_LIMIT = 8500
 DIAGNOSIS_MAX_COMPLETION_TOKENS = 1536
+
+
+class DiagnosisInputError(ValueError):
+    pass
+
+
+def load_json_object(path, label):
+    try:
+        with open(path, "r", encoding="utf-8") as file:
+            value = json.load(file)
+    except FileNotFoundError:
+        raise DiagnosisInputError(f"{label} file was not found: {path}") from None
+    except json.JSONDecodeError as error:
+        raise DiagnosisInputError(
+            f"{label} contains malformed JSON at line {error.lineno}, "
+            f"column {error.colno}: {path}"
+        ) from None
+    except (OSError, UnicodeError) as error:
+        raise DiagnosisInputError(
+            f"{label} could not be read ({type(error).__name__}): {path}"
+        ) from None
+
+    if not isinstance(value, dict):
+        raise DiagnosisInputError(f"{label} must contain a JSON object: {path}")
+    return value
+
+
+def validate_manual_reproduction(manual_reproduction):
+    if not isinstance(manual_reproduction, dict):
+        return "Manual reproduction context must be a JSON object."
+
+    steps = manual_reproduction.get("steps")
+    supporting_evidence = manual_reproduction.get("supporting_evidence", [])
+    if manual_reproduction.get("status") != "MANUAL_SUBMITTED":
+        return "Manual reproduction context has an invalid status."
+    if manual_reproduction.get("source") != "user":
+        return "Manual reproduction context must be identified as user-reported."
+    if (
+        not isinstance(steps, list)
+        or not steps
+        or any(not isinstance(step, str) or not step.strip() for step in steps)
+    ):
+        return "Manual reproduction context must include non-empty ordered steps."
+    if (
+        not isinstance(manual_reproduction.get("expected_behavior"), str)
+        or not manual_reproduction["expected_behavior"].strip()
+    ):
+        return "Manual reproduction context must include expected behavior."
+    if (
+        not isinstance(manual_reproduction.get("observed_behavior"), str)
+        or not manual_reproduction["observed_behavior"].strip()
+    ):
+        return "Manual reproduction context must include observed behavior."
+    if (
+        not isinstance(supporting_evidence, list)
+        or any(not isinstance(item, str) for item in supporting_evidence)
+    ):
+        return "Manual reproduction supporting evidence must be a list of strings."
+    return None
+
+
+def load_reproduction_result(path, manual_mode):
+    try:
+        reproduction_result = load_json_object(path, "Reproduction result")
+    except DiagnosisInputError as error:
+        if not manual_mode:
+            raise
+
+        availability = "INVALID" if os.path.exists(path) else "UNAVAILABLE"
+        return {
+            "status": availability,
+            "source": "automatic",
+            "automatically_reproduced": False,
+            "reason": str(error),
+        }
+
+    if manual_mode and reproduction_result.get("status") == "REPRODUCED":
+        raise DiagnosisInputError(
+            "Manual reproduction context cannot replace an automatic "
+            "result marked REPRODUCED."
+        )
+    return reproduction_result
 
 
 def sanitized_groq_status_error(error, api_key):
@@ -137,27 +220,25 @@ client = Groq(api_key=GROQ_API_KEY)
 
 
 # =========================================================
-# Load bug report
+# Parse optional diagnosis inputs
 # =========================================================
 
-if len(sys.argv) > 1:
+argument_parser = argparse.ArgumentParser()
+argument_parser.add_argument("bug_report", nargs="?")
+argument_parser.add_argument("--manual-reproduction")
+arguments = argument_parser.parse_args(sys.argv[1:])
 
-    bug_report_file = sys.argv[1]
-
-else:
-
+manual_reproduction_file = arguments.manual_reproduction
+bug_report_file = arguments.bug_report
+if not bug_report_file:
     bug_report_file = BUG_REPORT_PATH
 
 
 if os.path.exists(bug_report_file):
-
-    with open(
-        bug_report_file,
-        "r",
-        encoding="utf-8"
-    ) as file:
-
-        bug_report = json.load(file)
+    try:
+        bug_report = load_json_object(bug_report_file, "Bug report")
+    except DiagnosisInputError as error:
+        argument_parser.error(str(error))
 
     print(
         f"\nBug report loaded: {bug_report_file}"
@@ -184,37 +265,27 @@ else:
 
 
 # =========================================================
-# Load repository context
-# =========================================================
-
-with open(
-    REPOSITORY_CONTEXT_FILE,
-    "r",
-    encoding="utf-8"
-) as file:
-
-    repository_context = json.load(file)
-
-
-# =========================================================
-# Load reproduction result
-# =========================================================
-
-if not os.path.exists(REPRODUCTION_RESULT_FILE):
-
-    raise FileNotFoundError(
-        "reproduction_result.json was not found. "
-        "Run bug_reproduction_agent.py first."
+try:
+    repository_context = load_json_object(
+        REPOSITORY_CONTEXT_FILE,
+        "Repository context",
     )
+    manual_reproduction = None
+    if manual_reproduction_file:
+        manual_reproduction = load_json_object(
+            manual_reproduction_file,
+            "Manual reproduction context",
+        )
+        manual_error = validate_manual_reproduction(manual_reproduction)
+        if manual_error:
+            raise DiagnosisInputError(manual_error)
 
-
-with open(
-    REPRODUCTION_RESULT_FILE,
-    "r",
-    encoding="utf-8"
-) as file:
-
-    reproduction_result = json.load(file)
+    reproduction_result = load_reproduction_result(
+        REPRODUCTION_RESULT_FILE,
+        manual_mode=manual_reproduction is not None,
+    )
+except DiagnosisInputError as error:
+    argument_parser.error(str(error))
 
 
 print(
@@ -449,30 +520,67 @@ def compact_reproduction_result(reproduction, max_chars=2800):
     )
 
 
-def build_diagnosis_prompt(bug, reproduction, repository_context):
+def build_diagnosis_prompt(
+    bug,
+    reproduction,
+    repository_context,
+    manual_reproduction=None,
+):
+    if manual_reproduction is None:
+        reproduction_context = reproduction
+        source_guidance = (
+            "Use the confirmed automatic reproduction as primary evidence and "
+            "the bounded repository excerpts as supporting evidence."
+        )
+        reproduction_heading = "BUG REPRODUCTION RESULT"
+    else:
+        reproduction_context = {
+            "source": "user-reported-manual-reproduction",
+            "automatically_reproduced": False,
+            "automatic_reproduction_result": reproduction,
+            "manual_reproduction_report": manual_reproduction,
+        }
+        source_guidance = (
+            "The automatic reproduction did not confirm the issue. Treat the "
+            "manual reproduction report as user-provided evidence, not as an "
+            "automated test or confirmed automatic reproduction. Distinguish "
+            "reported observations from facts verified in repository code, and "
+            "do not claim that an automated reproduction test passed. Use the "
+            "bounded repository excerpts as supporting evidence."
+        )
+        reproduction_heading = "REPRODUCTION CONTEXT (MANUAL USER REPORT)"
+
     instruction = """You are an AI software bug diagnosis agent. Use the confirmed reproduction as primary evidence and the bounded repository excerpts as supporting evidence. Respect the detected language/framework; do not assume Python. Diagnose all reported symptoms, trace relevant data flow, identify exact affected files, explain the root cause, propose a minimal safe fix, and give a verification plan. Do not modify source or tests. Do not guess when evidence is insufficient. Return only a complete JSON object, no markdown or surrounding prose, using exactly this schema:
 {"bug_title":"string","project_type":"string","failure_analysis":"string","root_cause":"string","affected_files":["string"],"evidence":["string"],"proposed_fix":"string","verification_plan":["string"]}
 
 BUG REPORT:
 __BUG_REPORT_JSON__
 
-BUG REPRODUCTION RESULT:
+__REPRODUCTION_HEADING__:
 __REPRODUCTION_RESULT_JSON__
 
 BOUNDED REPOSITORY CONTEXT:
 __REPOSITORY_CONTEXT_JSON__
 """
+    instruction = instruction.replace(
+        "Use the confirmed reproduction as primary evidence and the bounded repository excerpts as supporting evidence.",
+        "__SOURCE_GUIDANCE__",
+    ).replace("__SOURCE_GUIDANCE__", source_guidance)
+    instruction = instruction.replace(
+        "__REPRODUCTION_HEADING__",
+        reproduction_heading,
+    )
     budgets = {"bug": 650, "reproduction": 2600, "context": 3000}
     for _attempt in range(8):
         compact_bug = compact_bug_report(bug, budgets["bug"])
         compact_reproduction = compact_reproduction_result(
-            reproduction,
+            reproduction_context,
             budgets["reproduction"],
         )
         compact_context = compact_repository_context(
             repository_context,
             bug,
-            reproduction,
+            reproduction_context,
             budgets["context"],
         )
         prompt = instruction.replace(
@@ -503,6 +611,7 @@ prompt = build_diagnosis_prompt(
     bug_report,
     reproduction_result,
     repository_context,
+    manual_reproduction,
 )
 
 

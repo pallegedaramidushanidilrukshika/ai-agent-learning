@@ -97,6 +97,9 @@ def capture_groq_diagnosis_prompt(
     repository_context,
     reproduction_result,
     bug_report,
+    manual_reproduction=None,
+    manual_reproduction_missing=False,
+    expected_exit_code=1,
 ):
     class StopBeforeDiagnosisResult(Exception):
         pass
@@ -106,9 +109,23 @@ def capture_groq_diagnosis_prompt(
     context_path = run_dir / "repository_context.json"
     reproduction_path = run_dir / "reproduction_result.json"
     bug_report_path = tmp_path / "prompt-capture-bug-report.json"
+    manual_reproduction_path = run_dir / "manual_reproduction.json"
     context_path.write_text(json.dumps(repository_context), encoding="utf-8")
-    reproduction_path.write_text(json.dumps(reproduction_result), encoding="utf-8")
+    if reproduction_result is not None:
+        reproduction_path.write_text(
+            reproduction_result
+            if isinstance(reproduction_result, str)
+            else json.dumps(reproduction_result),
+            encoding="utf-8",
+        )
     bug_report_path.write_text(json.dumps(bug_report), encoding="utf-8")
+    if manual_reproduction is not None:
+        manual_reproduction_path.write_text(
+            manual_reproduction
+            if isinstance(manual_reproduction, str)
+            else json.dumps(manual_reproduction),
+            encoding="utf-8",
+        )
 
     dotenv_module = ModuleType("dotenv")
     dotenv_module.load_dotenv = Mock()
@@ -122,9 +139,17 @@ def capture_groq_diagnosis_prompt(
     monkeypatch.setitem(sys.modules, "groq", groq_module)
     monkeypatch.setenv("GROQ_API_KEY", "mock-prompt-test-key")
     monkeypatch.setenv(ARTIFACT_DIR_ENV, os.fspath(run_dir))
-    monkeypatch.setattr(sys, "argv", ["bug_diagnosis_agent.py", os.fspath(bug_report_path)])
+    arguments = ["bug_diagnosis_agent.py", os.fspath(bug_report_path)]
+    if manual_reproduction is not None or manual_reproduction_missing:
+        arguments.extend([
+            "--manual-reproduction",
+            os.fspath(manual_reproduction_path),
+        ])
+    monkeypatch.setattr(sys, "argv", arguments)
     monkeypatch.setattr(sys, "dont_write_bytecode", True)
     monkeypatch.setattr(sys, "stdout", io.StringIO())
+    stderr = io.StringIO()
+    monkeypatch.setattr(sys, "stderr", stderr)
 
     groq_client = Mock()
     captured = {}
@@ -145,9 +170,14 @@ def capture_groq_diagnosis_prompt(
     with pytest.raises(SystemExit) as exit_error:
         spec.loader.exec_module(module)
 
-    assert exit_error.value.code == 1
-    assert groq_client.chat.completions.create.call_count == 1
-    return captured["messages"][0]["content"], captured, run_dir
+    assert exit_error.value.code == expected_exit_code
+    if expected_exit_code == 1:
+        assert groq_client.chat.completions.create.call_count == 1
+        prompt = captured["messages"][0]["content"]
+    else:
+        groq_client.chat.completions.create.assert_not_called()
+        prompt = None
+    return prompt, captured, run_dir, stderr.getvalue()
 
 
 def test_groq_diagnosis_prompt_bounds_oversized_context_and_preserves_evidence(
@@ -214,7 +244,7 @@ def test_groq_diagnosis_prompt_bounds_oversized_context_and_preserves_evidence(
         "affected_files": ["backend/src/websocket.js"],
     }
 
-    prompt, call_arguments, run_dir = capture_groq_diagnosis_prompt(
+    prompt, call_arguments, run_dir, _stderr = capture_groq_diagnosis_prompt(
         monkeypatch,
         tmp_path,
         repository_context,
@@ -236,6 +266,196 @@ def test_groq_diagnosis_prompt_bounds_oversized_context_and_preserves_evidence(
     assert "affected handler excerpt" in prompt
     assert "generated/irrelevant_3999.js" not in prompt
     assert "ignore-me-content" not in prompt
+
+
+def test_groq_diagnosis_prompt_labels_manual_evidence_as_unconfirmed(
+    tmp_path, monkeypatch
+):
+    repository_context = {
+        "repository_path": "C:/demo/repository",
+        "execution_strategy": {"technology": "Node.js"},
+        "file_contents": {"src/handler.js": "function handler() {}"},
+    }
+    automatic_result = {
+        "status": "NOT_REPRODUCED",
+        "executed": True,
+        "evidence": ["The automated scenario did not observe the failure."],
+    }
+    manual_reproduction = {
+        "status": "MANUAL_SUBMITTED",
+        "source": "user",
+        "automatic_reproduction_status": "NOT_REPRODUCED",
+        "steps": ["Open the page", "Submit the form"],
+        "expected_behavior": "The request is rejected",
+        "observed_behavior": "A blank record is saved",
+        "supporting_evidence": ["ValidationError was not shown"],
+    }
+
+    prompt, _call_arguments, _run_dir, _stderr = capture_groq_diagnosis_prompt(
+        monkeypatch,
+        tmp_path,
+        repository_context,
+        automatic_result,
+        {"bug_title": "Blank record saved"},
+        manual_reproduction,
+    )
+
+    assert "REPRODUCTION CONTEXT (MANUAL USER REPORT)" in prompt
+    assert "user-reported-manual-reproduction" in prompt
+    assert '"automatically_reproduced":false' in prompt
+    assert "NOT_REPRODUCED" in prompt
+    assert "Submit the form" in prompt
+    assert "A blank record is saved" in prompt
+    assert "do not claim that an automated reproduction test passed" in prompt
+
+
+@pytest.mark.parametrize(
+    ("reproduction_result", "expected_status"),
+    [
+        (None, "UNAVAILABLE"),
+        ("{ malformed", "INVALID"),
+    ],
+)
+def test_manual_diagnosis_labels_missing_or_malformed_automatic_result(
+    tmp_path,
+    monkeypatch,
+    reproduction_result,
+    expected_status,
+):
+    manual_reproduction = {
+        "status": "MANUAL_SUBMITTED",
+        "source": "user",
+        "automatic_reproduction_status": None,
+        "steps": ["Open the page", "Submit the form"],
+        "expected_behavior": "The request is rejected",
+        "observed_behavior": "A blank record is saved",
+        "supporting_evidence": ["ValidationError was not shown"],
+    }
+
+    prompt, _call_arguments, _run_dir, _stderr = capture_groq_diagnosis_prompt(
+        monkeypatch,
+        tmp_path,
+        {"repository_path": "C:/demo/repository"},
+        reproduction_result,
+        {"bug_title": "Blank record saved"},
+        manual_reproduction,
+    )
+
+    assert '"status":"' + expected_status + '"' in prompt
+    assert '"source":"automatic"' in prompt
+    assert '"automatically_reproduced":false' in prompt
+    assert "user-reported-manual-reproduction" in prompt
+    assert "Submit the form" in prompt
+    assert "do not claim that an automated reproduction test passed" in prompt
+
+
+@pytest.mark.parametrize(
+    (
+        "reproduction_result",
+        "manual_reproduction",
+        "manual_reproduction_missing",
+        "expected_message",
+    ),
+    [
+        (None, None, False, "Reproduction result file was not found"),
+        ("{", None, False, "Reproduction result contains malformed JSON"),
+        ("[]", None, False, "Reproduction result must contain a JSON object"),
+        (
+            {"status": "NOT_REPRODUCED"},
+            None,
+            True,
+            "Manual reproduction context file was not found",
+        ),
+        (
+            {"status": "NOT_REPRODUCED"},
+            "{",
+            False,
+            "Manual reproduction context contains malformed JSON",
+        ),
+        (
+            {"status": "NOT_REPRODUCED"},
+            "[]",
+            False,
+            "Manual reproduction context must contain a JSON object",
+        ),
+        (
+            {"status": "NOT_REPRODUCED"},
+            {},
+            False,
+            "Manual reproduction context has an invalid status",
+        ),
+    ],
+)
+def test_diagnosis_input_errors_are_controlled_without_tracebacks(
+    tmp_path,
+    monkeypatch,
+    reproduction_result,
+    manual_reproduction,
+    manual_reproduction_missing,
+    expected_message,
+):
+    _prompt, _call_arguments, _run_dir, stderr = capture_groq_diagnosis_prompt(
+        monkeypatch,
+        tmp_path,
+        {"repository_path": "C:/demo/repository"},
+        reproduction_result,
+        {"bug_title": "Input validation test"},
+        manual_reproduction,
+        manual_reproduction_missing=manual_reproduction_missing,
+        expected_exit_code=2,
+    )
+
+    assert expected_message in stderr
+    assert "Traceback" not in stderr
+
+
+@pytest.mark.parametrize(
+    ("field", "invalid_value", "remove_field", "expected_message"),
+    [
+        ("steps", "step", False, "non-empty ordered steps"),
+        ("steps", ["  "], False, "non-empty ordered steps"),
+        ("steps", [1], False, "non-empty ordered steps"),
+        ("expected_behavior", None, True, "expected behavior"),
+        ("expected_behavior", 42, False, "expected behavior"),
+        ("observed_behavior", None, True, "observed behavior"),
+        ("observed_behavior", [], False, "observed behavior"),
+        ("supporting_evidence", "error text", False, "list of strings"),
+        ("supporting_evidence", ["log", 1], False, "list of strings"),
+    ],
+)
+def test_diagnosis_agent_rejects_invalid_manual_field_types(
+    tmp_path,
+    monkeypatch,
+    field,
+    invalid_value,
+    remove_field,
+    expected_message,
+):
+    manual_reproduction = {
+        "status": "MANUAL_SUBMITTED",
+        "source": "user",
+        "steps": ["Open page", "Submit form"],
+        "expected_behavior": "The request is rejected",
+        "observed_behavior": "A blank record is saved",
+        "supporting_evidence": ["ValidationError"],
+    }
+    if remove_field:
+        manual_reproduction.pop(field)
+    else:
+        manual_reproduction[field] = invalid_value
+
+    _prompt, _call_arguments, _run_dir, stderr = capture_groq_diagnosis_prompt(
+        monkeypatch,
+        tmp_path,
+        {"repository_path": "C:/demo/repository"},
+        {"status": "NOT_REPRODUCED"},
+        {"bug_title": "Invalid manual evidence"},
+        manual_reproduction,
+        expected_exit_code=2,
+    )
+
+    assert expected_message in stderr
+    assert "Traceback" not in stderr
 
 
 def test_groq_api_status_error_metadata_is_sanitized(monkeypatch):
@@ -2560,11 +2780,27 @@ def test_orchestrator_persists_ai_diagnosis_metadata_in_workflow_report(
     }]
 
 
+def test_load_json_returns_none_for_invalid_utf8(tmp_path):
+    artifact = tmp_path / "invalid-utf8.json"
+    artifact.write_bytes(b"\xff")
+
+    assert workflow_orchestrator.load_json(artifact) is None
+
+
+@pytest.mark.parametrize("result", [None, [], "unexpected", 42, True])
+def test_diagnosis_failure_reason_handles_non_dict_results(result):
+    assert workflow_orchestrator.diagnosis_failure_reason(
+        result,
+        "Diagnosis failed.",
+    ) == "Diagnosis failed."
+
+
 def test_retry_failure_context_includes_all_latest_stage_artifacts(
     tmp_path, monkeypatch
 ):
     artifact_paths = {
         "REPRODUCTION_RESULT_FILE": "reproduction_result.json",
+        "MANUAL_REPRODUCTION_FILE": "manual_reproduction.json",
         "TEST_GENERATION_RESULT_FILE": "test_generation_result.json",
         "CODE_FIX_RESULT_FILE": "code_fix_result.json",
         "TEST_RESULT_FILE": "test_result.json",
@@ -2589,6 +2825,7 @@ def test_retry_failure_context_includes_all_latest_stage_artifacts(
 
     assert context == {
         "previous_reproduction_result": expected["reproduction_result.json"],
+        "manual_reproduction": expected["manual_reproduction.json"],
         "previous_test_generation_result": expected["test_generation_result.json"],
         "previous_code_fix_result": expected["code_fix_result.json"],
         "previous_test_result": expected["test_result.json"],
@@ -2664,6 +2901,14 @@ def run_mocked_retry_workflow(
     failure_stage=None,
     failed_attempts=(),
     analysis_success=True,
+    reproduction_status="REPRODUCED",
+    reproduction_process_success=True,
+    write_reproduction_artifact=True,
+    malformed_reproduction_artifact=None,
+    manual_artifact_override=None,
+    preexisting_manual_artifact=False,
+    manual_save_failure=False,
+    diagnosis_error=None,
 ):
     base_dir = tmp_path / "workflow-root"
     base_dir.mkdir()
@@ -2673,6 +2918,23 @@ def run_mocked_retry_workflow(
     bug_report_path.write_text(json.dumps({"bug_title": "Retry demo"}), encoding="utf-8")
     run_dir = base_dir / "workflow_runs" / "run-1"
     run_dir.mkdir(parents=True)
+    if preexisting_manual_artifact:
+        (run_dir / "manual_reproduction.json").write_bytes(b"prior artifact")
+    if manual_save_failure:
+        original_open = open
+        manual_artifact_path = os.fspath(run_dir / "manual_reproduction.json")
+
+        def fail_manual_artifact_open(path, *args, **kwargs):
+            if os.fspath(path) == manual_artifact_path and args and args[0] == "x":
+                raise OSError("simulated artifact write failure")
+            return original_open(path, *args, **kwargs)
+
+        monkeypatch.setattr(
+            workflow_orchestrator,
+            "open",
+            fail_manual_artifact_open,
+            raising=False,
+        )
     monkeypatch.setattr(workflow_orchestrator, "BASE_DIR", os.fspath(base_dir))
     monkeypatch.setattr(
         workflow_orchestrator,
@@ -2706,6 +2968,7 @@ def run_mocked_retry_workflow(
         "test_generation", "test_execution", "verification", "code_fix",
         "build", "runtime",
     )}
+    diagnosis_arguments_seen = []
     retry_failure_contexts = []
     failed_attempts = set(failed_attempts)
 
@@ -2720,15 +2983,41 @@ def run_mocked_retry_workflow(
             return {"success": analysis_success, "return_code": 0 if analysis_success else 1}
         elif name == "bug_reproduction_agent":
             calls["bug_reproduction"] += 1
-            workflow_orchestrator.save_json(
-                workflow_orchestrator.REPRODUCTION_RESULT_FILE,
-                {"status": "REPRODUCED", "executed": True, "evidence": ["observed"]},
-            )
+            if write_reproduction_artifact:
+                if malformed_reproduction_artifact is not None:
+                    Path(workflow_orchestrator.REPRODUCTION_RESULT_FILE).write_text(
+                        malformed_reproduction_artifact,
+                        encoding="utf-8",
+                    )
+                else:
+                    workflow_orchestrator.save_json(
+                        workflow_orchestrator.REPRODUCTION_RESULT_FILE,
+                        {
+                            "status": reproduction_status,
+                            "executed": True,
+                            "evidence": ["observed"],
+                        },
+                    )
+            return {
+                "success": reproduction_process_success,
+                "return_code": 0 if reproduction_process_success else 1,
+                "error": "simulated reproduction process failure"
+                if not reproduction_process_success
+                else "",
+            }
         elif name == "bug_diagnosis_agent":
             calls["bug_diagnosis"] += 1
-            if arguments:
+            diagnosis_arguments_seen.append(arguments or [])
+            if arguments and arguments[0] != "--manual-reproduction":
                 retry_report = workflow_orchestrator.load_json(arguments[0])
                 retry_failure_contexts.append(retry_report.get("failure_context", {}))
+            if diagnosis_error:
+                return {
+                    "success": False,
+                    "return_code": 2,
+                    "output": "",
+                    "error": diagnosis_error,
+                }
             workflow_orchestrator.save_json(
                 workflow_orchestrator.DIAGNOSIS_FILE,
                 diagnosis,
@@ -2790,7 +3079,422 @@ def run_mocked_retry_workflow(
     monkeypatch.setattr(workflow_orchestrator, "run_code_fix_stage", fake_code_fix_stage)
     monkeypatch.setattr(workflow_orchestrator, "run_component_builds", fake_build)
     monkeypatch.setattr(workflow_orchestrator, "run_post_fix_runtime_validation", fake_runtime)
+    if manual_artifact_override is not None:
+        original_collect_manual_reproduction = (
+            workflow_orchestrator.collect_manual_reproduction
+        )
+
+        def collect_then_override_manual_artifact(reproduction):
+            result = original_collect_manual_reproduction(reproduction)
+            if result["status"] == "CAPTURED":
+                workflow_orchestrator.save_json(
+                    workflow_orchestrator.MANUAL_REPRODUCTION_FILE,
+                    manual_artifact_override,
+                )
+            return result
+
+        monkeypatch.setattr(
+            workflow_orchestrator,
+            "collect_manual_reproduction",
+            collect_then_override_manual_artifact,
+        )
+    calls["diagnosis_arguments"] = diagnosis_arguments_seen
     return workflow_orchestrator.main(), run_dir, calls, retry_failure_contexts
+
+
+def set_manual_reproduction_input(monkeypatch, answers):
+    monkeypatch.setattr(
+        workflow_orchestrator.sys,
+        "stdin",
+        SimpleNamespace(isatty=lambda: True),
+    )
+    responses = iter(answers)
+    monkeypatch.setattr(builtins, "input", lambda _prompt: next(responses))
+
+
+def test_orchestrator_manual_reproduction_continues_through_fix_and_verification(
+    tmp_path, monkeypatch
+):
+    set_manual_reproduction_input(monkeypatch, [
+        "yes",
+        "Open the task page",
+        "Submit a blank task",
+        "",
+        "The task should be rejected",
+        "A blank task appears",
+        "ValidationError: task is required",
+        "",
+    ])
+    result, run_dir, calls, _retry_contexts = run_mocked_retry_workflow(
+        tmp_path,
+        monkeypatch,
+        reproduction_status="NOT_REPRODUCED",
+    )
+
+    report = json.loads((run_dir / "workflow_report.json").read_text(encoding="utf-8"))
+    manual_path = run_dir / "manual_reproduction.json"
+    manual = json.loads(manual_path.read_text(encoding="utf-8"))
+    reproduction = json.loads(
+        (run_dir / "reproduction_result.json").read_text(encoding="utf-8")
+    )
+    stage = next(item for item in report["stages"] if item["stage"] == 2)
+
+    assert result == 0
+    assert report["final_status"] == "PASS"
+    assert report["reproduction_source"] == "manual"
+    assert report["reproduction_evidence"]["automatic_result_ref"] == "reproduction_result.json"
+    assert report["reproduction_evidence"]["manual_report_ref"] == "manual_reproduction.json"
+    assert report["reproduction_evidence"]["manual_supporting_evidence"] == [
+        "ValidationError: task is required"
+    ]
+    assert manual["status"] == "MANUAL_SUBMITTED"
+    assert manual["steps"] == ["Open the task page", "Submit a blank task"]
+    assert manual["expected_behavior"] == "The task should be rejected"
+    assert manual["observed_behavior"] == "A blank task appears"
+    assert manual["supporting_evidence"] == ["ValidationError: task is required"]
+    assert manual_path.parent == run_dir
+    assert reproduction["status"] == "NOT_REPRODUCED"
+    assert stage["status"] == "MANUAL_CAPTURED"
+    assert stage["details"]["manual_fallback"]["status"] == "CAPTURED"
+    assert calls["diagnosis_arguments"][0] == [
+        "--manual-reproduction",
+        str(manual_path),
+    ]
+    assert calls["bug_diagnosis"] == 1
+    assert calls["code_fix"] == 1
+    assert calls["test_generation"] == 1
+    assert calls["test_execution"] == 1
+    assert calls["verification"] == 1
+
+
+def test_manual_reproduction_context_is_preserved_for_retry_diagnosis(
+    tmp_path, monkeypatch
+):
+    set_manual_reproduction_input(monkeypatch, [
+        "yes", "Open the task page", "Submit a blank task", "",
+        "The task should be rejected", "A blank task appears",
+        "ValidationError: task is required", "",
+    ])
+    result, run_dir, calls, retry_contexts = run_mocked_retry_workflow(
+        tmp_path,
+        monkeypatch,
+        failure_stage="verification",
+        failed_attempts={1},
+        reproduction_status="NOT_REPRODUCED",
+    )
+
+    report = json.loads((run_dir / "workflow_report.json").read_text(encoding="utf-8"))
+    manual_path = run_dir / "manual_reproduction.json"
+
+    assert result == 0
+    assert report["final_status"] == "PASS"
+    assert [item["overall"] for item in report["retry_history"]] == ["FAIL", "PASS"]
+    assert calls["bug_diagnosis"] == 2
+    assert calls["code_fix"] == 2
+    assert calls["diagnosis_arguments"][0] == [
+        "--manual-reproduction",
+        str(manual_path),
+    ]
+    assert calls["diagnosis_arguments"][1][1:] == [
+        "--manual-reproduction",
+        str(manual_path),
+    ]
+    assert retry_contexts[0]["manual_reproduction"]["source"] == "user"
+    assert retry_contexts[0]["manual_reproduction"]["steps"] == [
+        "Open the task page",
+        "Submit a blank task",
+    ]
+
+
+@pytest.mark.parametrize(
+    ("write_reproduction_artifact", "malformed_reproduction_artifact"),
+    [
+        (False, None),
+        (True, "{ malformed"),
+    ],
+)
+def test_manual_reproduction_continues_when_automatic_artifact_is_unavailable_or_invalid(
+    tmp_path,
+    monkeypatch,
+    write_reproduction_artifact,
+    malformed_reproduction_artifact,
+):
+    set_manual_reproduction_input(monkeypatch, [
+        "yes", "Open the task page", "Submit a blank task", "",
+        "The task should be rejected", "A blank task appears",
+        "ValidationError: task is required", "",
+    ])
+    result, run_dir, calls, _retry_contexts = run_mocked_retry_workflow(
+        tmp_path,
+        monkeypatch,
+        write_reproduction_artifact=write_reproduction_artifact,
+        malformed_reproduction_artifact=malformed_reproduction_artifact,
+    )
+
+    report = json.loads((run_dir / "workflow_report.json").read_text(encoding="utf-8"))
+    stage = next(item for item in report["stages"] if item["stage"] == 2)
+    manual_path = run_dir / "manual_reproduction.json"
+
+    assert result == 0
+    assert report["final_status"] == "PASS"
+    assert report["reproduction_source"] == "manual"
+    assert report["reproduction_evidence"]["manual_report_ref"] == "manual_reproduction.json"
+    assert stage["status"] == "MANUAL_CAPTURED"
+    assert calls["diagnosis_arguments"][0] == [
+        "--manual-reproduction",
+        str(manual_path),
+    ]
+    assert calls["bug_diagnosis"] == 1
+    assert calls["code_fix"] == 1
+    assert calls["test_generation"] == 1
+    assert calls["test_execution"] == 1
+    assert calls["verification"] == 1
+
+
+@pytest.mark.parametrize(
+    ("field", "invalid_value", "remove_field"),
+    [
+        ("steps", "step", False),
+        ("steps", ["  "], False),
+        ("steps", [1], False),
+        ("expected_behavior", None, True),
+        ("expected_behavior", 42, False),
+        ("observed_behavior", None, True),
+        ("observed_behavior", [], False),
+        ("supporting_evidence", "error text", False),
+        ("supporting_evidence", ["log", 1], False),
+    ],
+)
+def test_orchestrator_stops_before_diagnosis_for_invalid_manual_field_types(
+    tmp_path,
+    monkeypatch,
+    field,
+    invalid_value,
+    remove_field,
+):
+    set_manual_reproduction_input(monkeypatch, [
+        "yes", "Open the task page", "Submit the form", "",
+        "The task should be rejected", "A blank record is saved", "", "",
+    ])
+    manual_artifact = {
+        "status": "MANUAL_SUBMITTED",
+        "source": "user",
+        "steps": ["Open the task page", "Submit the form"],
+        "expected_behavior": "The task should be rejected",
+        "observed_behavior": "A blank record is saved",
+        "supporting_evidence": [],
+    }
+    if remove_field:
+        manual_artifact.pop(field)
+    else:
+        manual_artifact[field] = invalid_value
+
+    result, run_dir, calls, _retry_contexts = run_mocked_retry_workflow(
+        tmp_path,
+        monkeypatch,
+        reproduction_status="NOT_REPRODUCED",
+        manual_artifact_override=manual_artifact,
+    )
+
+    report = json.loads((run_dir / "workflow_report.json").read_text(encoding="utf-8"))
+    stage = next(item for item in report["stages"] if item["stage"] == 2)
+
+    assert result == 1
+    assert report["final_status"] == "FAIL"
+    assert stage["status"] == "FAILED"
+    assert stage["details"]["manual_fallback"]["status"] == "INSUFFICIENT"
+    assert not (run_dir / "diagnosis.json").exists()
+    assert calls["bug_diagnosis"] == 0
+    assert calls["code_fix"] == 0
+
+
+def test_orchestrator_stops_when_manual_reproduction_is_insufficient(
+    tmp_path, monkeypatch
+):
+    set_manual_reproduction_input(monkeypatch, ["yes", "", "Expected result", "Observed result", ""])
+    result, run_dir, calls, _retry_contexts = run_mocked_retry_workflow(
+        tmp_path,
+        monkeypatch,
+        reproduction_status="NOT_REPRODUCED",
+    )
+
+    report = json.loads((run_dir / "workflow_report.json").read_text(encoding="utf-8"))
+    stage = next(item for item in report["stages"] if item["stage"] == 2)
+
+    assert result == 1
+    assert stage["details"]["manual_fallback"]["status"] == "INSUFFICIENT"
+    assert stage["details"]["manual_fallback"]["missing_fields"] == [
+        "reproduction_steps"
+    ]
+    assert not (run_dir / "manual_reproduction.json").exists()
+    assert calls["bug_diagnosis"] == 0
+    assert calls["code_fix"] == 0
+
+
+def test_orchestrator_stops_when_manual_reproduction_is_cancelled(
+    tmp_path, monkeypatch
+):
+    set_manual_reproduction_input(monkeypatch, ["yes", "cancel"])
+    result, run_dir, calls, _retry_contexts = run_mocked_retry_workflow(
+        tmp_path,
+        monkeypatch,
+        reproduction_status="NOT_REPRODUCED",
+    )
+
+    report = json.loads((run_dir / "workflow_report.json").read_text(encoding="utf-8"))
+    stage = next(item for item in report["stages"] if item["stage"] == 2)
+
+    assert result == 1
+    assert stage["details"]["manual_fallback"]["status"] == "CANCELLED"
+    assert not (run_dir / "manual_reproduction.json").exists()
+    assert calls["bug_diagnosis"] == 0
+    assert calls["code_fix"] == 0
+
+
+def test_manual_reproduction_does_not_overwrite_existing_artifact(
+    tmp_path, monkeypatch
+):
+    set_manual_reproduction_input(monkeypatch, [
+        "yes", "Repeat the action", "", "Expected result", "Observed result", "", "",
+    ])
+    result, run_dir, calls, _retry_contexts = run_mocked_retry_workflow(
+        tmp_path,
+        monkeypatch,
+        reproduction_status="NOT_REPRODUCED",
+        preexisting_manual_artifact=True,
+    )
+
+    report = json.loads((run_dir / "workflow_report.json").read_text(encoding="utf-8"))
+    stage = next(item for item in report["stages"] if item["stage"] == 2)
+
+    assert result == 1
+    assert (run_dir / "manual_reproduction.json").read_bytes() == b"prior artifact"
+    assert stage["details"]["manual_fallback"]["status"] == "ARTIFACT_CONFLICT"
+    assert json.loads((run_dir / "reproduction_result.json").read_text(encoding="utf-8"))[
+        "status"
+    ] == "NOT_REPRODUCED"
+    assert calls["bug_diagnosis"] == 0
+    assert calls["code_fix"] == 0
+
+
+def test_manual_reproduction_save_failure_stops_before_diagnosis(
+    tmp_path, monkeypatch
+):
+    set_manual_reproduction_input(monkeypatch, [
+        "yes", "Repeat the action", "", "Expected result", "Observed result", "", "",
+    ])
+    result, run_dir, calls, _retry_contexts = run_mocked_retry_workflow(
+        tmp_path,
+        monkeypatch,
+        reproduction_status="NOT_REPRODUCED",
+        manual_save_failure=True,
+    )
+
+    report = json.loads((run_dir / "workflow_report.json").read_text(encoding="utf-8"))
+    stage = next(item for item in report["stages"] if item["stage"] == 2)
+
+    assert result == 1
+    assert stage["details"]["manual_fallback"]["status"] == "SAVE_FAILED"
+    assert "simulated artifact write failure" in stage["details"]["manual_fallback"]["reason"]
+    assert not (run_dir / "manual_reproduction.json").exists()
+    assert calls["bug_diagnosis"] == 0
+    assert calls["code_fix"] == 0
+
+
+def test_reproduced_artifact_with_failed_agent_stops_without_manual_fallback(
+    tmp_path, monkeypatch
+):
+    monkeypatch.setattr(
+        workflow_orchestrator.sys,
+        "stdin",
+        SimpleNamespace(isatty=lambda: True),
+    )
+    monkeypatch.setattr(
+        builtins,
+        "input",
+        lambda _prompt: pytest.fail("Contradictory automatic evidence must not prompt."),
+    )
+    result, run_dir, calls, _retry_contexts = run_mocked_retry_workflow(
+        tmp_path,
+        monkeypatch,
+        reproduction_status="REPRODUCED",
+        reproduction_process_success=False,
+    )
+
+    report = json.loads((run_dir / "workflow_report.json").read_text(encoding="utf-8"))
+    stage = next(item for item in report["stages"] if item["stage"] == 2)
+    automatic_result = json.loads(
+        (run_dir / "reproduction_result.json").read_text(encoding="utf-8")
+    )
+
+    assert result == 1
+    assert report["final_status"] == "FAIL"
+    assert report["reproduction_source"] == "unresolved_conflict"
+    assert automatic_result["status"] == "REPRODUCED"
+    assert stage["status"] == "FAILED"
+    assert "contradiction" in stage["details"]["reason"].lower()
+    assert "manual_fallback" not in stage["details"]
+    assert not (run_dir / "manual_reproduction.json").exists()
+    assert calls["bug_diagnosis"] == 0
+    assert calls["code_fix"] == 0
+
+
+def test_manual_diagnosis_error_is_preserved_in_workflow_report(
+    tmp_path, monkeypatch
+):
+    set_manual_reproduction_input(monkeypatch, [
+        "yes", "Repeat the action", "", "Expected result", "Observed result", "", "",
+    ])
+    result, run_dir, calls, _retry_contexts = run_mocked_retry_workflow(
+        tmp_path,
+        monkeypatch,
+        reproduction_status="NOT_REPRODUCED",
+        diagnosis_error=(
+            "usage: bug_diagnosis_agent.py; error: "
+            "Manual reproduction context file was not found"
+        ),
+    )
+
+    report = json.loads((run_dir / "workflow_report.json").read_text(encoding="utf-8"))
+    diagnosis_stage = next(
+        item for item in report["stages"]
+        if item["name"] == "AI Failure Analysis & Root Cause Identification"
+    )
+
+    assert result == 1
+    assert report["final_status"] == "FAIL"
+    assert calls["bug_diagnosis"] == 1
+    assert calls["code_fix"] == 0
+    assert "Manual reproduction context file was not found" in diagnosis_stage["details"]["reason"]
+
+
+def test_noninteractive_reproduction_failure_does_not_prompt(
+    tmp_path, monkeypatch
+):
+    monkeypatch.setattr(
+        workflow_orchestrator.sys,
+        "stdin",
+        SimpleNamespace(isatty=lambda: False),
+    )
+    monkeypatch.setattr(
+        builtins,
+        "input",
+        lambda _prompt: pytest.fail("Non-interactive workflow must not prompt."),
+    )
+    result, run_dir, calls, _retry_contexts = run_mocked_retry_workflow(
+        tmp_path,
+        monkeypatch,
+        reproduction_status="NOT_REPRODUCED",
+    )
+
+    report = json.loads((run_dir / "workflow_report.json").read_text(encoding="utf-8"))
+    stage = next(item for item in report["stages"] if item["stage"] == 2)
+
+    assert result == 1
+    assert stage["details"]["manual_fallback"]["status"] == "NOT_OFFERED"
+    assert not (run_dir / "manual_reproduction.json").exists()
+    assert calls["bug_diagnosis"] == 0
+    assert calls["code_fix"] == 0
 
 
 def test_orchestrator_retry_loop_successful_run_and_recovery(tmp_path, monkeypatch):
@@ -2801,6 +3505,9 @@ def test_orchestrator_retry_loop_successful_run_and_recovery(tmp_path, monkeypat
     report = json.loads((run_dir / "workflow_report.json").read_text(encoding="utf-8"))
     assert result == 0
     assert report["final_status"] == "PASS"
+    assert report["reproduction_source"] == "automatic"
+    assert report["reproduction_evidence"]["automatic_result_ref"] == "reproduction_result.json"
+    assert report["reproduction_evidence"]["manual_report_ref"] is None
     assert [attempt["overall"] for attempt in report["retry_history"]] == ["PASS"]
     assert calls["code_fix"] == 1
     assert calls["bug_diagnosis"] == 1
