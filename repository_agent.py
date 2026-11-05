@@ -826,6 +826,31 @@ def read_file(repo_path, relative_path):
         return f"Unable to read file: {error}"
 
 
+LOCAL_IMPORT_PATTERN = re.compile(
+    r"""(?:\bfrom\s+|\bimport\s+|\brequire\(\s*)['"](\.{1,2}/[^'"]+)['"]"""
+)
+MAX_LOCAL_IMPORTS = 10
+
+
+def local_imports(repo_path, source_file, files):
+    """Repository files a JavaScript/TypeScript file imports with a relative path."""
+    if os.path.splitext(source_file)[1].lower() not in {".js", ".mjs", ".cjs", ".ts"}:
+        return []
+    known = {os.path.normcase(os.path.normpath(item)): item for item in files}
+    found = []
+    for specifier in LOCAL_IMPORT_PATTERN.findall(read_file(repo_path, source_file)):
+        base = os.path.normpath(os.path.join(os.path.dirname(source_file), specifier))
+        for candidate in (base, base + ".js", base + ".ts", base + ".mjs", base + ".cjs",
+                          os.path.join(base, "index.js"), os.path.join(base, "index.ts")):
+            match = known.get(os.path.normcase(os.path.normpath(candidate)))
+            if match:
+                found.append(match)
+                break
+        if len(found) >= MAX_LOCAL_IMPORTS:
+            break
+    return found
+
+
 def find_important_files(files, repo_path=None):
     """Identify files useful for understanding the project."""
 
@@ -882,6 +907,14 @@ def find_important_files(files, repo_path=None):
             important_files.append(file)
 
     if repo_path:
+        # Entry files usually only wire things up; the request handlers live
+        # in the local modules they import (server.js -> ./routes/record.js).
+        for entry_file in list(important_files):
+            if os.path.basename(entry_file).lower() in backend_entry_files:
+                important_files.extend(
+                    local_imports(repo_path, entry_file, files)
+                )
+
         for config_file in files:
             if os.path.basename(config_file).lower() not in {
                 "serverless.yml",

@@ -13,6 +13,7 @@ import urllib.request
 import urllib.error
 
 from workflow_artifacts import resolve_artifact_path
+from workflow_validation import project_process_environment
 
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -458,6 +459,27 @@ def prepare_runtime_configuration(working_directory):
     return config_path
 
 
+def node_dependencies_current(working_directory):
+    """True when node_modules was installed from the current lock file.
+
+    npm writes node_modules/.package-lock.json after every install; if it is
+    newer than package.json and package-lock.json, the tree is up to date.
+    Without a lock file the install is never skipped.
+    """
+    installed_marker = os.path.join(working_directory, "node_modules", ".package-lock.json")
+    lock_file = os.path.join(working_directory, "package-lock.json")
+    package_json = os.path.join(working_directory, "package.json")
+    try:
+        installed_at = os.path.getmtime(installed_marker)
+        return (
+            os.path.isfile(lock_file)
+            and installed_at >= os.path.getmtime(lock_file)
+            and installed_at >= os.path.getmtime(package_json)
+        )
+    except OSError:
+        return False
+
+
 def start_application(
     repository_path,
     start_command,
@@ -465,7 +487,11 @@ def start_application(
     readiness_path="/",
     working_directory=None,
     environment=None,
+    explicit_environment=None,
 ):
+    """environment holds allowlisted overrides (such as PORT).
+    explicit_environment holds values the workflow sets on purpose, such as
+    a temporary database URL; they are passed through unfiltered."""
     working_directory = working_directory or repository_path
     parts = resolve_start_command(
         working_directory,
@@ -496,7 +522,11 @@ def start_application(
             "package.json",
         )
 
-        if os.path.exists(package_json):
+        if os.path.exists(package_json) and node_dependencies_current(working_directory):
+            # One run starts the app many times (replays, every test run);
+            # reinstalling an unchanged tree each time only costs minutes.
+            print("\n--- Application dependencies already installed; skipping install ---")
+        elif os.path.exists(package_json):
             print("\n--- Installing Application Dependencies ---")
 
             npm_command = "npm.cmd" if os.name == "nt" else "npm"
@@ -507,6 +537,7 @@ def start_application(
             install_process = subprocess.run(
                 install_command,
                 cwd=working_directory,
+                env=project_process_environment(),
                 capture_output=True,
                 text=True,
                 timeout=300,
@@ -524,9 +555,13 @@ def start_application(
         last_error = "Application did not become ready."
 
         for attempt in range(1, 4):
-            process_environment = os.environ.copy()
-            if environment:
-                process_environment.update(environment)
+            process_environment = project_process_environment(
+                overrides=environment
+            )
+            if isinstance(explicit_environment, dict):
+                process_environment.update(
+                    {str(name): str(value) for name, value in explicit_environment.items()}
+                )
 
             process = subprocess.Popen(
                 parts,

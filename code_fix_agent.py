@@ -11,8 +11,11 @@ from langchain_core.tools import tool
 from groq import Groq
 
 from workflow_artifacts import ARTIFACT_DIR_ENV, resolve_artifact_path
+from workflow_validation import source_change_errors
 
-
+# The Groq free tier allows 8,000 tokens per minute. The SDK waits for the
+# retry-after time the API returns, so a few retries let the minute reset.
+GROQ_MAX_RETRIES = 5
 
 # ---------------------------------------------------------
 # LOAD ENVIRONMENT VARIABLES
@@ -25,7 +28,7 @@ api_key = os.getenv("GROQ_API_KEY")
 if not api_key:
     raise ValueError("GROQ_API_KEY was not found.")
 
-groq_client = Groq(api_key=api_key)
+groq_client = Groq(api_key=api_key, max_retries=GROQ_MAX_RETRIES)
 
 def print_utf8(value):
     text = str(value)
@@ -64,6 +67,10 @@ CODE_FIX_RESULT_FILE = resolve_artifact_path(
     "code_fix_result.json",
     BASE_DIR,
 )
+CODE_FIX_ORIGINALS_FILE = resolve_artifact_path(
+    "code_fix_originals.json",
+    BASE_DIR,
+)
 
 ORIGINAL_FILE_CONTENTS = {}
 WRITE_RESULTS = {}
@@ -95,6 +102,7 @@ with open(DIAGNOSIS_FILE, "r", encoding="utf-8") as f:
 llm = ChatGroq(
     model="openai/gpt-oss-20b",
     temperature=0,
+    max_retries=GROQ_MAX_RETRIES,
 )
 
 
@@ -207,7 +215,32 @@ def write_file(file_path: str, content: str) -> str:
             with open(full_path, "r", encoding="utf-8") as file:
                 before_content = file.read()
 
-        ORIGINAL_FILE_CONTENTS[full_path] = before_content
+        # Refuse changes that cannot be correct (broken syntax, a config file
+        # replaced by code, undeclared packages). The reason goes back to the
+        # model so it can correct the change.
+        change_errors = source_change_errors(
+            os.path.relpath(full_path, repository_root),
+            before_content,
+            content,
+            repository_root,
+        )
+        if change_errors:
+            message = "Write rejected: " + " ".join(change_errors)
+            print_utf8(f"{file_path}: {message}")
+            WRITE_RESULTS[full_path] = {
+                "verified": False,
+                "message": message,
+            }
+            return json.dumps(
+                {
+                    "file": file_path,
+                    "verified": False,
+                    "message": message,
+                }
+            )
+
+        # Keep the content from before this agent's first write, for the diff.
+        ORIGINAL_FILE_CONTENTS.setdefault(full_path, before_content)
 
         with open(full_path, "w", encoding="utf-8") as file:
             file.write(content)
@@ -300,6 +333,11 @@ IMPORTANT:
 - Do NOT create pytest tests.
 - Do NOT create new unit tests unless explicitly requested.
 - Fix the actual application source code.
+- Configuration, schema and infrastructure files listed in
+  "affected_files" (for example database key schemas, migrations
+  or serverless templates) are part of the fix. Update them together
+  with the code when the diagnosis requires it, keeping the code and
+  the schema consistent with each other.
 - Make the minimum necessary changes.
 - Preserve existing functionality.
 - Do not modify unrelated files.
@@ -665,6 +703,19 @@ with open(
 ) as file:
     json.dump(
         code_fix_result,
+        file,
+        indent=2,
+        ensure_ascii=False,
+    )
+
+# Original content of every file this run changed, so a reviewer can see the diff.
+with open(CODE_FIX_ORIGINALS_FILE, "w", encoding="utf-8") as file:
+    json.dump(
+        {
+            os.path.relpath(path, TARGET_REPOSITORY).replace(os.sep, "/"): original
+            for path, original in ORIGINAL_FILE_CONTENTS.items()
+            if WRITE_RESULTS.get(path, {}).get("verified") is True
+        },
         file,
         indent=2,
         ensure_ascii=False,

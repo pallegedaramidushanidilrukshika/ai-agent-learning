@@ -44,3 +44,4 @@ level3-serverless-app/node_modules/
 level3-serverless-app/**/node_modules/
 level3-serverless-app/backend/.serverless/
 level3-serverless-app/frontend/dist/
+browser_replay/node_modules/

@@ -1,4 +1,5 @@
 import { useEffect, useRef, useState } from 'react'
+import WorkflowConsole from './WorkflowConsole'
 import './App.css'
 
 const WEBSOCKET_URL =
@@ -7,7 +8,7 @@ const ACKNOWLEDGEMENT_TIMEOUT_MS = 10_000
 
 type DeliveryStatus = 'Idle' | 'Pending' | 'Saved' | 'Failed' | 'Not confirmed'
 
-function App() {
+function WebSocketDemo() {
   const [message, setMessage] = useState('')
   const [connectionStatus, setConnectionStatus] = useState('Connecting...')
   const [deliveryStatus, setDeliveryStatus] = useState<DeliveryStatus>('Idle')
@@ -188,6 +189,12 @@ function App() {
       </div>
     </div>
   )
+}
+
+function App() {
+  return window.location.pathname === '/websocket-demo'
+    ? <WebSocketDemo />
+    : <WorkflowConsole />
 }
 
 export default App

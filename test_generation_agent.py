@@ -1,3 +1,4 @@
+import contextlib
 import json
 import importlib.util
 import os
@@ -11,6 +12,15 @@ from langchain.agents import create_agent
 from langchain.tools import tool
 from langchain_groq import ChatGroq
 from workflow_artifacts import resolve_artifact_path
+from workflow_validation import parse_test_summary, project_process_environment, run_bounded
+
+# The Groq free tier allows 8,000 tokens per minute. The SDK waits for the
+# retry-after time the API returns, so a few retries let the minute reset.
+GROQ_MAX_RETRIES = 5
+
+# Jest prints symbols such as ●; a cp1252 console cannot encode them.
+if hasattr(sys.stdout, "reconfigure"):
+    sys.stdout.reconfigure(encoding="utf-8", errors="replace")
 
 # ============================================================
 # PATHS
@@ -75,6 +85,155 @@ def fail(message):
     print(f"ERROR: {message}")
 
     return 1
+
+
+# For HTTP apps tested with node:test the workflow starts the app and stops
+# it after the run. A test that starts the app itself (and may never stop
+# it) would hang the run, so such tests are rejected and rewritten.
+APP_BASE_URL_VARIABLE = "REPRODUCTION_BASE_URL"
+APP_START_PATTERNS = (
+    (re.compile(r"child_process"), "do not use child_process"),
+    (re.compile(r"\b(?:spawn|spawnSync|exec|execSync|execFile|fork)\s*\("), "do not start processes"),
+    (re.compile(r"\.listen\s*\("), "do not call listen(); the app is already running"),
+    (
+        re.compile(r"""(?:require\(|from\s+|import\()\s*['"]\.{1,2}/(?:[\w./-]*/)?(?:index|app|server|main)(?:\.[cm]?js)?['"]"""),
+        "do not require or import the application; send HTTP requests to it",
+    ),
+)
+APP_RUN_RULES = f"""
+
+    APPLICATION UNDER TEST (MANDATORY):
+
+    The workflow starts the application before every test run
+    and stops it afterwards. Its base URL is in the environment
+    variable {APP_BASE_URL_VARIABLE}.
+
+    - Send HTTP requests with the built-in fetch to
+      new URL(path, process.env.{APP_BASE_URL_VARIABLE}).
+    - Do NOT start, spawn, fork, require or import the
+      application, do NOT use child_process, and do NOT call
+      listen(). create_test_file rejects such tests.
+    - Use node:test and node:assert only; no new packages.
+    - For HTML pages, assert on the response body text.
+    - For form posts, send application/x-www-form-urlencoded
+      bodies with URLSearchParams, then GET the page again.
+    """
+
+
+ESM_TEST_RULE = """
+    The test file is an ES module (the package uses "type": "module"):
+    use import statements, not require().
+    """
+
+
+def app_start_problems(content):
+    """Reasons a generated test would start or import the app itself."""
+    problems = [message for pattern, message in APP_START_PATTERNS if pattern.search(content)]
+    if APP_BASE_URL_VARIABLE not in content:
+        problems.append(f"read the app URL from process.env.{APP_BASE_URL_VARIABLE}")
+    return problems
+
+
+def app_base_url_from_entry(source):
+    """The local URL an app's entry file listens on, e.g. app.listen(3000)."""
+    match = re.search(r"process\.env\.PORT\s*\|\|\s*(\d{2,5})", source) or re.search(
+        r"\.listen\(\s*(\d{2,5})", source
+    )
+    return f"http://localhost:{match.group(1)}" if match else None
+
+
+def build_dynamodb_message_regression_test(
+        diagnosis,
+        has_node_backend,
+        handler_import,
+        config_relative_path,
+):
+        if not has_node_backend or not isinstance(diagnosis, dict):
+                return None
+
+        diagnosis_text = json.dumps(diagnosis, ensure_ascii=False).lower()
+        describes_message_overwrite = (
+                "dynamodb" in diagnosis_text
+                and "message" in diagnosis_text
+                and any(
+                        phrase in diagnosis_text
+                        for phrase in (
+                                "overwrite",
+                                "sort key",
+                                "messageid",
+                                "separate record",
+                        )
+                )
+        )
+        if not describes_message_overwrite:
+                return None
+
+        template = r'''const mockSend = jest.fn().mockResolvedValue({});
+
+jest.mock("@aws-sdk/client-dynamodb", () => ({
+    DynamoDBClient: jest.fn().mockImplementation(() => ({ send: mockSend })),
+    PutItemCommand: jest.fn().mockImplementation((input) => ({ input })),
+}));
+
+const fs = require("node:fs");
+const path = require("node:path");
+const { message } = require("__HANDLER_IMPORT__");
+
+test("stores repeated WebSocket messages as separate records", async () => {
+    const eventFor = (messageText, requestId) => ({
+        body: JSON.stringify({ message: messageText, requestId }),
+        requestContext: { connectionId: "connection-regression" },
+    });
+
+    await message(eventFor("first message", "request-1"));
+    await message(eventFor("second message", "request-2"));
+
+    const items = mockSend.mock.calls.map(([command]) => command.input.Item);
+    expect(items).toHaveLength(2);
+    expect(items.map((item) => item.connectionId.S)).toEqual([
+        "connection-regression",
+        "connection-regression",
+    ]);
+    expect(items.map((item) => item.message.S)).toEqual([
+        "first message",
+        "second message",
+    ]);
+
+    // Read the table key from the configuration instead of assuming an
+    // attribute name, so any correct composite key passes.
+    const tableDefinition = fs.readFileSync(
+        path.resolve(__dirname, "__CONFIG_RELATIVE_PATH__"),
+        "utf8",
+    );
+    const lines = tableDefinition.split(/\r?\n/);
+    const start = lines.findIndex((line) => line.trim() === "KeySchema:");
+    expect(start).toBeGreaterThanOrEqual(0);
+    const indent = lines[start].search(/\S/);
+    const keyAttributes = [];
+    for (const line of lines.slice(start + 1)) {
+        if (line.trim() === "") continue;
+        if (line.search(/\S/) <= indent) break;
+        const match = line.match(/AttributeName:\s*["']?([\w-]+)["']?/);
+        if (match) keyAttributes.push(match[1]);
+    }
+    expect(keyAttributes.length).toBeGreaterThan(1);
+
+    const keys = items.map((item) =>
+        keyAttributes.map((name) => item[name] && item[name].S).join("|")
+    );
+    for (const item of items) {
+        for (const name of keyAttributes) {
+            expect(item[name] && item[name].S).toBeTruthy();
+        }
+    }
+    expect(new Set(keys).size).toBe(2);
+});
+'''
+        return template.replace(
+                "__HANDLER_IMPORT__", handler_import
+        ).replace(
+                "__CONFIG_RELATIVE_PATH__", config_relative_path
+        )
 
 
 def main():
@@ -365,6 +524,9 @@ def main():
     # TEST DISCOVERY
     # ============================================================
 
+    READ_FILE_LIMIT = 3000
+    TEST_OUTPUT_LIMIT = 2500
+
     TEST_EXTENSIONS = {
         ".py",
         ".js",
@@ -481,6 +643,38 @@ def main():
         and isinstance(http_reproduction.get("state_check"), dict)
     )
 
+    backend_relative = execution_strategy.get("backend_path") or "."
+
+    def backend_package():
+        try:
+            with open(
+                os.path.join(TARGET_REPOSITORY, backend_relative, "package.json"),
+                "r",
+                encoding="utf-8",
+            ) as handle:
+                package = json.load(handle)
+        except (OSError, ValueError):
+            return {}
+        return package if isinstance(package, dict) else {}
+
+    def backend_declares_jest():
+        package = backend_package()
+        return any(
+            isinstance(package.get(section), dict) and "jest" in package[section]
+            for section in ("dependencies", "devDependencies")
+        )
+
+    # The detected framework is a guess ("Cypress / Jest" for MERN). An HTTP
+    # backend whose package does not declare Jest is tested with Node's
+    # built-in runner instead, which needs no install.
+    node_test_for_backend = (
+        not configured_http_test
+        and has_node_backend
+        and "jest" in framework_text
+        and "http" in str(execution_strategy.get("validation_method") or "").lower()
+        and not backend_declares_jest()
+    )
+
 
     # ============================================================
     # GENERATED TEST PATH
@@ -488,11 +682,28 @@ def main():
 
     def choose_generated_test_path():
 
+        if node_test_for_backend:
+            return os.path.join(
+                TARGET_REPOSITORY,
+                backend_relative,
+                "test",
+                "generated-regression.test.js",
+            )
+
         if configured_http_test:
             return os.path.join(
                 TARGET_REPOSITORY,
                 "test",
                 "generated-http-regression.test.cjs",
+            )
+
+        if has_node_backend and "jest" in framework_text:
+            backend_path = execution_strategy.get("backend_path") or "backend"
+            return os.path.join(
+                TARGET_REPOSITORY,
+                backend_path,
+                "test",
+                "generated-regression.test.js",
             )
 
         if PROJECT_CATEGORY == "python":
@@ -628,6 +839,133 @@ def main():
     if configured_http_test:
         test_framework = "node:test (HTTP integration)"
         test_command = ["node", "--test", TEST_FILE_RELATIVE]
+
+    if node_test_for_backend:
+        test_framework = "node:test"
+        test_command = ["node", "--test", TEST_FILE_RELATIVE]
+
+    # An HTTP app tested with node:test: the workflow runs the app for each
+    # test run, and the AI's test only sends requests to it.
+    workflow_runs_app = (
+        not configured_http_test
+        and is_node_project()
+        and "http" in str(execution_strategy.get("validation_method") or "").lower()
+        and str(test_framework or "").strip().lower() == "node:test"
+        and bool(execution_strategy.get("start_command"))
+    )
+
+    def load_reproduction_helpers():
+        spec = importlib.util.spec_from_file_location(
+            "workflow_reproduction_helpers",
+            os.path.join(BASE_DIR, "bug_reproduction_agent.py"),
+        )
+        helpers = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(helpers)
+        return helpers
+
+    def application_base_url():
+        configured = execution_strategy.get("backend_base_url") or execution_strategy.get("base_url")
+        if isinstance(configured, str) and configured.strip():
+            return configured.strip().rstrip("/")
+        for token in str(execution_strategy.get("start_command")).split():
+            if re.fullmatch(r"[\w./\\-]+\.[cm]?js", token):
+                entry = safe_repository_path(token)
+                if entry and os.path.isfile(entry):
+                    with open(entry, "r", encoding="utf-8", errors="replace") as handle:
+                        return app_base_url_from_entry(handle.read())
+        return None
+
+    @contextlib.contextmanager
+    def application_for_tests():
+        """Start the app for one test run and always stop it afterwards.
+
+        Yields the extra environment for the test command."""
+        if not workflow_runs_app:
+            yield {}
+            return
+        helpers = load_reproduction_helpers()
+        import browser_replay_agent as full_stack
+
+        frontend, backend = full_stack.web_components(repository_context)
+        if frontend and backend:
+            # Full-stack app: the test talks to the backend API. The backend
+            # gets a temporary database, never the user's real one.
+            backend_directory = os.path.join(TARGET_REPOSITORY, backend["path"])
+            url = helpers.normalize_base_url(
+                backend.get("base_url") or execution_strategy.get("backend_base_url")
+            )
+            if not url:
+                raise RuntimeError("The backend URL is not known.")
+            if full_stack.port_in_use(url):
+                raise RuntimeError(f"{url} is already in use; stop your own copy of the backend.")
+            with contextlib.ExitStack() as services:
+                explicit = {}
+                if full_stack.uses_mongodb(repository_context):
+                    names = full_stack.mongodb_uri_variables(backend_directory)
+                    if not names:
+                        raise RuntimeError(
+                            "The MongoDB setting was not found in an example env file; "
+                            "refusing to run tests against the real database."
+                        )
+                    uri = services.enter_context(full_stack.isolated_mongodb())
+                    explicit = {name: uri for name in names}
+                process, start_error = helpers.start_application(
+                    TARGET_REPOSITORY,
+                    backend.get("start_command") or execution_strategy.get("backend_start_command"),
+                    base_url=url,
+                    readiness_path="/",
+                    working_directory=backend_directory,
+                    environment={},
+                    explicit_environment=explicit,
+                )
+                if start_error:
+                    raise RuntimeError(f"The backend could not be started: {start_error}")
+                services.callback(helpers.stop_process, process)
+                yield {APP_BASE_URL_VARIABLE: url}
+            return
+
+        base_url = application_base_url()
+        if not base_url:
+            raise RuntimeError("The application's local URL could not be determined.")
+        runtime = helpers.runtime_configuration(
+            TARGET_REPOSITORY, repository_context, execution_strategy, {"base_url": base_url}
+        )
+        url, overrides, endpoint_error = helpers.isolate_local_endpoint(
+            TARGET_REPOSITORY, repository_context, runtime["base_url"]
+        )
+        if endpoint_error:
+            raise RuntimeError(endpoint_error)
+        app_environment = project_process_environment()
+        app_environment.update(overrides)
+        process, start_error = helpers.start_application(
+            TARGET_REPOSITORY,
+            runtime["start_command"],
+            base_url=url,
+            readiness_path="/",
+            working_directory=runtime["working_directory"],
+            environment=app_environment,
+        )
+        if start_error:
+            raise RuntimeError(f"The application could not be started: {start_error}")
+        try:
+            yield {APP_BASE_URL_VARIABLE: url}
+        finally:
+            helpers.stop_process(process)
+
+    def run_test_command(command):
+        with application_for_tests() as app_environment:
+            environment = project_process_environment()
+            environment.update(app_environment)
+            return run_bounded(
+                command,
+                cwd=TARGET_REPOSITORY,
+                env=environment,
+                capture_output=True,
+                text=True,
+                encoding="utf-8",
+                errors="replace",
+                check=False,
+            )
 
 
     def configured_http_test_source():
@@ -777,7 +1115,15 @@ def main():
                 encoding="utf-8",
             ) as file:
 
-                return file.read()
+                text = file.read()
+            # Keep each tool result small: the provider's per-minute token
+            # limit (8,000 on the free tier) covers the whole conversation.
+            if len(text) > READ_FILE_LIMIT:
+                return (
+                    text[:READ_FILE_LIMIT]
+                    + f"\n... [truncated: showing {READ_FILE_LIMIT} of {len(text)} characters]"
+                )
+            return text
 
         except Exception as error:
 
@@ -810,6 +1156,15 @@ def main():
                 return (
                     "ERROR: Generated test content is empty."
                 )
+
+            if workflow_runs_app:
+                problems = app_start_problems(content)
+                if problems:
+                    return (
+                        "ERROR: The test was not saved. The workflow starts "
+                        "the application itself; rewrite the test so that it "
+                        "only sends HTTP requests: " + "; ".join(problems) + "."
+                    )
 
             test_directory = os.path.dirname(
                 TEST_FILE
@@ -896,13 +1251,7 @@ def main():
                     "ERROR: Test command is empty."
                 )
 
-            result = subprocess.run(
-                command,
-                cwd=TARGET_REPOSITORY,
-                capture_output=True,
-                text=True,
-                check=False,
-            )
+            result = run_test_command(command)
 
             stdout = result.stdout or ""
             stderr = result.stderr or ""
@@ -912,6 +1261,15 @@ def main():
                 + "\n"
                 + stderr
             )
+
+            # The whole conversation is resent each turn; keep the part of
+            # the output that matters (summary and failures are at the end)
+            # so the request stays under the model's per-minute token limit.
+            if len(output) > TEST_OUTPUT_LIMIT:
+                output = (
+                    f"[... first {len(output) - TEST_OUTPUT_LIMIT} characters omitted ...]\n"
+                    + output[-TEST_OUTPUT_LIMIT:]
+                )
 
             return (
                 f"RETURN CODE: {result.returncode}\n"
@@ -942,6 +1300,78 @@ def main():
             )
         )
 
+    def create_controlled_fallback_test():
+        if not has_node_backend or "jest" not in framework_text:
+            return None
+
+        backend_path = execution_strategy.get("backend_path") or "backend"
+        candidate_paths = [
+            affected_file
+            for affected_file in diagnosis.get("affected_files", [])
+            if isinstance(affected_file, str)
+        ]
+        candidate_paths.extend([
+            os.path.join(backend_path, "src", "websocket.js"),
+            os.path.join(backend_path, "index.js"),
+        ])
+
+        handler_path = None
+        for relative_path in candidate_paths:
+            try:
+                candidate = safe_repository_path(relative_path)
+            except ValueError:
+                continue
+            if not os.path.isfile(candidate):
+                continue
+            try:
+                with open(candidate, "r", encoding="utf-8") as source_file:
+                    source = source_file.read()
+            except (OSError, UnicodeError):
+                continue
+            if (
+                "PutItemCommand" in source
+                and "connectionId" in source
+                and re.search(r"exports\.message\s*=", source)
+            ):
+                handler_path = candidate
+                break
+
+        config_candidates = [
+            os.path.join(backend_path, "serverless.yml"),
+            "serverless.yml",
+        ]
+        config_path = None
+        for relative_path in config_candidates:
+            try:
+                candidate = safe_repository_path(relative_path)
+            except ValueError:
+                continue
+            if os.path.isfile(candidate):
+                config_path = candidate
+                break
+        if handler_path is None or config_path is None:
+            return None
+
+        handler_import = os.path.relpath(
+            handler_path,
+            os.path.dirname(TEST_FILE),
+        ).replace(os.sep, "/")
+        handler_import = os.path.splitext(handler_import)[0]
+        if not handler_import.startswith("."):
+            handler_import = "./" + handler_import
+
+        config_relative_path = os.path.relpath(
+            config_path,
+            os.path.dirname(TEST_FILE),
+        ).replace(os.sep, "/")
+
+        return build_dynamodb_message_regression_test(
+            diagnosis,
+            has_node_backend,
+            handler_import,
+            config_relative_path,
+        )
+
 
     # ============================================================
     # LLM
@@ -950,6 +1380,7 @@ def main():
     llm = ChatGroq(
         model="openai/gpt-oss-20b",
         temperature=0,
+        max_retries=GROQ_MAX_RETRIES,
     )
 
 
@@ -989,7 +1420,7 @@ def main():
     {existing_tests}
 
     Diagnosis:
-    {json.dumps(diagnosis, indent=2, ensure_ascii=False)}
+    {json.dumps(diagnosis, ensure_ascii=False, separators=(",", ":"))}
 
 
     MANDATORY WORKFLOW:
@@ -1052,7 +1483,11 @@ def main():
 
     25. Finish only after the generated test file exists
         and the configured test command has been executed.
-    """
+    """ + (APP_RUN_RULES if workflow_runs_app else "") + (
+        ESM_TEST_RULE
+        if workflow_runs_app and node_test_for_backend and backend_package().get("type") == "module"
+        else ""
+    )
 
 
     # ============================================================
@@ -1079,13 +1514,7 @@ def main():
 
     Do not modify application code or existing tests.
 
-    Diagnosis:
-
-    {json.dumps(
-        diagnosis,
-        indent=2,
-        ensure_ascii=False,
-    )}
+    The diagnosis is in the system instructions.
     """
 
 
@@ -1114,6 +1543,7 @@ def main():
             backend_process = None
             backend_url = None
             backend_environment = {}
+            environment_for_test = project_process_environment()
 
             if http_reproduction.get("component_type") == "backend":
                 reproduction_agent_path = os.path.join(
@@ -1143,28 +1573,30 @@ def main():
                 if endpoint_error:
                     raise RuntimeError(endpoint_error)
 
-                environment_for_test = os.environ.copy()
                 environment_for_test["REPRODUCTION_BASE_URL"] = backend_url
-                os.environ["REPRODUCTION_BASE_URL"] = backend_url
+                backend_process_environment = project_process_environment()
+                backend_process_environment.update(backend_environment)
                 backend_process, start_error = reproduction_helpers.start_application(
                     TARGET_REPOSITORY,
                     backend_runtime["start_command"],
                     base_url=backend_url,
                     readiness_path=backend_runtime["readiness_path"],
                     working_directory=backend_runtime["working_directory"],
-                    environment=backend_environment,
+                    environment=backend_process_environment,
                 )
                 if start_error:
                     raise RuntimeError(start_error)
 
             command = build_test_command()
             try:
-                process = subprocess.run(
+                process = run_bounded(
                     command,
                     cwd=TARGET_REPOSITORY,
-                    env=environment_for_test if backend_process else None,
+                    env=environment_for_test,
                     capture_output=True,
                     text=True,
+                    encoding="utf-8",
+                    errors="replace",
                     check=False,
                 )
             finally:
@@ -1175,16 +1607,18 @@ def main():
             stderr = process.stderr or ""
             combined = f"{stdout}\n{stderr}"
 
-            def test_count(pattern):
-                match = re.search(pattern, combined, re.IGNORECASE)
-                return int(match.group(1)) if match else None
-
-            total_tests = test_count(r"(?:ℹ\s*)?tests\s+(\d+)")
-            passed_tests = test_count(r"(?:ℹ\s*)?pass\s+(\d+)")
-            failed_tests = test_count(r"(?:ℹ\s*)?fail\s+(\d+)")
+            total_tests, passed_tests, failed_tests, skipped_tests = parse_test_summary(combined)
             status = (
                 "SUCCESS"
-                if process.returncode == 0 and total_tests and total_tests > 0
+                if (
+                    process.returncode == 0
+                    and isinstance(total_tests, int)
+                    and total_tests > 0
+                    and isinstance(passed_tests, int)
+                    and passed_tests > 0
+                    and failed_tests == 0
+                    and passed_tests + skipped_tests == total_tests
+                )
                 else "FAILED"
             )
 
@@ -1203,6 +1637,7 @@ def main():
                 "tests": total_tests,
                 "passed": passed_tests,
                 "failed": failed_tests,
+                "skipped": skipped_tests,
                 "return_code": process.returncode,
                 "stdout": stdout,
                 "stderr": stderr,
@@ -1245,16 +1680,31 @@ def main():
             system_prompt=system_prompt,
         )
 
-        result = agent.invoke(
-            {
-                "messages": [
+        # The provider occasionally rejects a malformed tool call
+        # ("tool_use_failed"). Ask once more before using the fallback.
+        for generation_attempt in (1, 2):
+            try:
+                result = agent.invoke(
                     {
-                        "role": "user",
-                        "content": message,
+                        "messages": [
+                            {
+                                "role": "user",
+                                "content": message,
+                            }
+                        ]
                     }
-                ]
-            }
-        )
+                )
+                break
+            except Exception as generation_error:
+                if (
+                    generation_attempt == 2
+                    or "tool_use_failed" not in str(generation_error)
+                ):
+                    raise
+                print(
+                    "\nThe model returned a malformed tool call; "
+                    "retrying test generation once."
+                )
 
 
     except Exception as error:
@@ -1266,110 +1716,53 @@ def main():
         print("=============================")
         print(error_message)
 
-        # ---------------------------------------------------------
-        # Controlled fallback for LLM failures / token-limit errors
-        # ---------------------------------------------------------
-        print("\nAttempting controlled Node.js test generation fallback...")
+        print("\nAttempting diagnosis-specific regression fallback...")
+        fallback_code = create_controlled_fallback_test()
+        if fallback_code:
+            try:
+                os.makedirs(os.path.dirname(TEST_FILE), exist_ok=True)
+                with open(TEST_FILE, "w", encoding="utf-8") as handle:
+                    handle.write(fallback_code)
 
-        try:
-            if PROJECT_CATEGORY == "node":
-
-                test_dir = os.path.join(TARGET_REPOSITORY, "test")
-                os.makedirs(test_dir, exist_ok=True)
-
-                fallback_test_path = os.path.join(
-                TARGET_REPOSITORY,
-                TEST_FILE_RELATIVE
+                command = build_test_command()
+                process = run_bounded(
+                    command,
+                    cwd=TARGET_REPOSITORY,
+                    env=project_process_environment(),
+                    capture_output=True,
+                    text=True,
+                    encoding="utf-8",
+                    errors="replace",
+                    check=False,
                 )
-
-                fallback_test = r'''const test = require("node:test");
-    const assert = require("node:assert/strict");
-    const fs = require("node:fs");
-    const path = require("node:path");
-
-    test("Regression - empty tasks are rejected", () => {
-        const projectRoot = path.resolve(__dirname, "..");
-        const source = fs.readFileSync(
-            path.join(projectRoot, "index.js"),
-            "utf8"
-        );
-
-        assert.match(
-            source,
-            /req\.body\.newtask/,
-            "The add-task route should read newtask"
-        );
-
-        assert.match(
-            source,
-            /newTask\s*=\s*\(req\.body\.newtask\s*\|\|\s*["']{2}\)\.trim\(\)/,
-            "The task input should be trimmed"
-        );
-
-        assert.match(
-            source,
-            /if\s*\([^)]*newTask\.length\s*>\s*0[^)]*\)/,
-            "Empty tasks should be rejected"
-        );
-
-        assert.match(
-            source,
-            /task\.push\(newTask\)/,
-            "Valid tasks should still be added"
-        );
-    });
-    '''
-
-                with open(
-                    fallback_test_path,
-                    "w",
-                    encoding="utf-8"
-                ) as handle:
-                    handle.write(fallback_test)
-
+                stdout = process.stdout or ""
+                stderr = process.stderr or ""
+                status = "SUCCESS" if process.returncode == 0 else "FAILED"
                 result_data = {
-                    "status": "PASSED",
-                    "message": "LLM test generation failed; controlled Node.js regression test fallback was created.",
+                    "status": status,
+                    "message": "A targeted regression fallback was generated and executed.",
                     "technology": technology,
                     "project_category": PROJECT_CATEGORY,
                     "languages": languages,
-                    "test_framework": "node:test",
+                    "test_framework": test_framework,
                     "test_command": test_command,
+                    "execution_command": command,
                     "test_file": TEST_FILE_RELATIVE,
                     "fallback": True,
                     "error": error_message,
+                    "return_code": process.returncode,
+                    "stdout": stdout,
+                    "stderr": stderr,
                 }
-
                 save_json(result_data)
+                print("\n" + stdout + stderr)
+                sys.exit(0 if status == "SUCCESS" else 1)
 
-                print("\n=============================")
-                print("TEST GENERATION FALLBACK")
-                print("=============================")
-                print(f"Generated test: {TEST_FILE_RELATIVE}")
-
-                sys.exit(0)
-
-        except Exception as fallback_error:
-
-            result_data = {
-                "status": "FAILED",
-                "message": f"Fallback test generation failed: {fallback_error}",
-                "technology": technology,
-                "project_category": PROJECT_CATEGORY,
-                "languages": languages,
-                "test_framework": test_framework,
-                "test_command": test_command,
-                "test_file": TEST_FILE_RELATIVE,
-            }
-
-            save_json(result_data)
-
-            print("\n=============================")
-            print("FALLBACK TEST GENERATION ERROR")
-            print("=============================")
-            print(str(fallback_error))
-
-            sys.exit(1)
+            except Exception as fallback_error:
+                error_message = (
+                    f"Targeted fallback generation or execution failed: "
+                    f"{fallback_error}"
+                )
 
         result_data = {
             "status": "FAILED",
@@ -1437,37 +1830,6 @@ def main():
     # FALLBACK EXTRACTION
     # ============================================================
 
-    def create_controlled_fallback_test():
-        """Return a regression test for the diagnosed empty-task bug."""
-
-        if PROJECT_CATEGORY != "node":
-            return None
-
-        return r'''const test = require("node:test");
-    const assert = require("node:assert/strict");
-    const fs = require("node:fs");
-    const path = require("node:path");
-
-    test("Regression - empty tasks are rejected", () => {
-        const projectRoot = path.resolve(__dirname, "..");
-        const source = fs.readFileSync(
-            path.join(projectRoot, "index.js"),
-            "utf8"
-        );
-
-        assert.match(source, /req\.body\.newtask/);
-        assert.match(
-            source,
-            /newTask\s*=\s*\(req\.body\.newtask\s*\|\|\s*["']{2}\)\.trim\(\)/
-        );
-        assert.match(
-            source,
-            /if\s*\([^)]*newTask\.length\s*>\s*0[^)]*\)/
-        );
-        assert.match(source, /task\.push\(newTask\)/);
-    });
-    '''
-
     def extract_code_block(text):
 
         if not text:
@@ -1508,13 +1870,9 @@ def main():
             agent_text
         )
 
-        # If the LLM tool call itself failed, use the
-        # technology-aware controlled fallback.
+        # Use a fallback only when it directly covers the diagnosis.
         if not fallback_code:
-
-            fallback_code = (
-                create_controlled_fallback_test()
-            )
+            fallback_code = create_controlled_fallback_test()
 
             if fallback_code:
                 print(
@@ -1632,13 +1990,7 @@ def main():
 
         command = build_test_command()
 
-        process = subprocess.run(
-            command,
-            cwd=TARGET_REPOSITORY,
-            capture_output=True,
-            text=True,
-            check=False,
-        )
+        process = run_test_command(command)
 
         stdout = process.stdout or ""
         stderr = process.stderr or ""
@@ -1686,36 +2038,7 @@ def main():
     # TEST DISCOVERY CHECK
     # ============================================================
 
-    def extract_number(pattern, text):
-
-        match = re.search(
-            pattern,
-            text,
-            re.IGNORECASE,
-        )
-
-        if match:
-            return int(
-                match.group(1)
-            )
-
-        return None
-
-
-    total_tests = extract_number(
-        r"(?:ℹ\s*)?tests?\s+(\d+)",
-        combined,
-    )
-
-    passed_tests = extract_number(
-        r"(?:ℹ\s*)?pass(?:ed)?\s+(\d+)",
-        combined,
-    )
-
-    failed_tests = extract_number(
-        r"(?:ℹ\s*)?fail(?:ed|ures)?\s+(\d+)",
-        combined,
-    )
+    total_tests, passed_tests, failed_tests, skipped_tests = parse_test_summary(combined)
 
 
     # ============================================================
@@ -1726,8 +2049,12 @@ def main():
 
     if (
         process.returncode == 0
-        and total_tests is not None
+        and isinstance(total_tests, int)
         and total_tests > 0
+        and isinstance(passed_tests, int)
+        and passed_tests > 0
+        and failed_tests == 0
+        and passed_tests + skipped_tests == total_tests
     ):
 
         status = "SUCCESS"
@@ -1754,9 +2081,13 @@ def main():
         "tests": total_tests,
         "passed": passed_tests,
         "failed": failed_tests,
+        "skipped": skipped_tests,
         "return_code": process.returncode,
         "stdout": stdout,
         "stderr": stderr,
+        # The test needs the app the workflow started; Test Execution
+        # reuses this result instead of running it without the app.
+        "workflow_started_app": workflow_runs_app,
     }
 
 

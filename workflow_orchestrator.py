@@ -10,8 +10,40 @@ import uuid
 from datetime import datetime
 
 from workflow_artifacts import ARTIFACT_DIR_ENV, resolve_artifact_path
+from workflow_control import (
+    CONTROL_DIRECTORY_ENV,
+    WORKFLOW_ID_ENV,
+    WORKFLOW_RUN_DIRECTORY_ENV,
+    WorkflowStopRequested,
+    check_stop_requested,
+    control_enabled,
+    control_directory,
+    publish_workflow_state,
+    record_stage,
+    recording_feedback,
+    wait_for_blocker_action,
+    wait_for_fix_review,
+    wait_for_manual_reproduction,
+    wait_for_reproduction_review,
+)
+from workflow_validation import (
+    BUILD_COMMAND_TIMEOUT_SECONDS,
+    run_bounded,
+    build_result_has_success_evidence,
+    diagnosis_validation_errors,
+    project_process_environment,
+    runtime_result_has_success_evidence,
+    test_result_has_success_evidence,
+)
 from local_websocket_demo import run_level3_websocket_demo
+import browser_recording
+import reproduction_tests
 
+# Agent output contains symbols such as the Jest marker; a cp1252 console or
+# log pipe cannot encode them, and print() would crash the whole workflow.
+for _stream in (sys.stdout, sys.stderr):
+    if hasattr(_stream, "reconfigure"):
+        _stream.reconfigure(encoding="utf-8", errors="replace")
 
 # ============================================================
 # BASE CONFIGURATION
@@ -19,6 +51,13 @@ from local_websocket_demo import run_level3_websocket_demo
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 MAX_RETRIES = 2
+# Rounds of "AI writes a reproduction test, human reviews it".
+MAX_REPRODUCTION_TEST_ROUNDS = 3
+AI_REPRODUCTION_SOURCE = "ai_reproduction_test"
+# A Playwright codegen recording the user uploaded, replayed as steps.
+BROWSER_RECORDING_SOURCE = "browser_recording"
+# Sources whose reproduction is an executable check that must pass after the fix.
+CONFIRMED_SOURCES = ("automatic", AI_REPRODUCTION_SOURCE, BROWSER_RECORDING_SOURCE)
 
 
 # ============================================================
@@ -33,6 +72,16 @@ BUG_REPORT_FILE = os.path.join(
 REPOSITORY_CONTEXT_FILE = resolve_artifact_path("repository_context.json", BASE_DIR)
 REPRODUCTION_RESULT_FILE = resolve_artifact_path("reproduction_result.json", BASE_DIR)
 MANUAL_REPRODUCTION_FILE = resolve_artifact_path("manual_reproduction.json", BASE_DIR)
+REPRODUCTION_TEST_FILE = resolve_artifact_path("reproduction_test.json", BASE_DIR)
+CONFIRMED_REPRODUCTION_TEST_FILE = resolve_artifact_path(
+    "confirmed_reproduction_test.json", BASE_DIR
+)
+REPRODUCTION_TEST_FEEDBACK_FILE = resolve_artifact_path(
+    "reproduction_test_feedback.json", BASE_DIR
+)
+CODE_FIX_ORIGINALS_FILE = resolve_artifact_path("code_fix_originals.json", BASE_DIR)
+FIX_BASELINE_FILE = resolve_artifact_path("fix_baseline.json", BASE_DIR)
+FIX_REVIEW_FILE = resolve_artifact_path("fix_review.json", BASE_DIR)
 
 DIAGNOSIS_FILE = resolve_artifact_path("diagnosis.json", BASE_DIR)
 
@@ -56,6 +105,8 @@ WORKFLOW_REPORT_FILE = resolve_artifact_path("workflow_report.json", BASE_DIR)
 ACTIVE_BUG_REPORT_FILE = BUG_REPORT_FILE
 ACTIVE_RUN_ARTIFACT_DIR = None
 CHILD_ENV_OVERRIDES = {}
+# Progress of the current run, so a Stop Safely report keeps completed stages.
+ACTIVE_WORKFLOW_PROGRESS = None
 
 
 # ============================================================
@@ -87,6 +138,8 @@ AGENTS = {
     "test_generation": "test_generation_agent.py",
     "test_execution": "test_result_checker.py",
     "verification": "verification_agent.py",
+    "reproduction_test": "reproduction_test_agent.py",
+    "browser_replay": "browser_replay_agent.py",
 }
 
 
@@ -99,6 +152,11 @@ def print_header(title):
 
 
 def print_stage(number, name):
+    if control_enabled():
+        if check_stop_requested(name):
+            raise WorkflowStopRequested(name)
+        publish_workflow_state("RUNNING", name)
+        record_stage(number, name, "RUNNING")
     print(f"\n{'-' * 75}\nSTAGE {number}: {name}\n{'-' * 75}")
 
 
@@ -179,6 +237,12 @@ def configure_run_artifact_paths(run_dir=None):
     global REPOSITORY_CONTEXT_FILE
     global REPRODUCTION_RESULT_FILE
     global MANUAL_REPRODUCTION_FILE
+    global REPRODUCTION_TEST_FILE
+    global CONFIRMED_REPRODUCTION_TEST_FILE
+    global REPRODUCTION_TEST_FEEDBACK_FILE
+    global CODE_FIX_ORIGINALS_FILE
+    global FIX_BASELINE_FILE
+    global FIX_REVIEW_FILE
     global DIAGNOSIS_FILE
     global CODE_FIX_RESULT_FILE
     global TEST_GENERATION_RESULT_FILE
@@ -198,6 +262,20 @@ def configure_run_artifact_paths(run_dir=None):
     MANUAL_REPRODUCTION_FILE = resolve_artifact_path(
         "manual_reproduction.json", BASE_DIR, run_dir
     )
+    REPRODUCTION_TEST_FILE = resolve_artifact_path(
+        "reproduction_test.json", BASE_DIR, run_dir
+    )
+    CONFIRMED_REPRODUCTION_TEST_FILE = resolve_artifact_path(
+        "confirmed_reproduction_test.json", BASE_DIR, run_dir
+    )
+    REPRODUCTION_TEST_FEEDBACK_FILE = resolve_artifact_path(
+        "reproduction_test_feedback.json", BASE_DIR, run_dir
+    )
+    CODE_FIX_ORIGINALS_FILE = resolve_artifact_path(
+        "code_fix_originals.json", BASE_DIR, run_dir
+    )
+    FIX_BASELINE_FILE = resolve_artifact_path("fix_baseline.json", BASE_DIR, run_dir)
+    FIX_REVIEW_FILE = resolve_artifact_path("fix_review.json", BASE_DIR, run_dir)
     DIAGNOSIS_FILE = resolve_artifact_path(
         "diagnosis.json",
         BASE_DIR,
@@ -285,7 +363,7 @@ def run_agent(script_name, arguments=None):
         f"\nRunning: {' '.join(command)}"
     )
 
-    child_environment = os.environ.copy()
+    child_environment = local_workflow_environment()
     child_environment.update(CHILD_ENV_OVERRIDES)
     if ACTIVE_RUN_ARTIFACT_DIR:
         child_environment[ARTIFACT_DIR_ENV] = ACTIVE_RUN_ARTIFACT_DIR
@@ -335,15 +413,219 @@ def diagnosis_failure_reason(result, fallback):
     return fallback
 
 
+def local_workflow_environment():
+    environment = os.environ.copy()
+    for name in (
+        "AWS_ACCESS_KEY_ID",
+        "AWS_SECRET_ACCESS_KEY",
+        "AWS_SESSION_TOKEN",
+        "AWS_SECURITY_TOKEN",
+        "AWS_PROFILE",
+        "AWS_DEFAULT_PROFILE",
+        "AWS_SHARED_CREDENTIALS_FILE",
+        "AWS_CONFIG_FILE",
+        "AWS_WEB_IDENTITY_TOKEN_FILE",
+        "AWS_ROLE_ARN",
+        "AWS_CONTAINER_CREDENTIALS_RELATIVE_URI",
+        "AWS_CONTAINER_CREDENTIALS_FULL_URI",
+    ):
+        environment.pop(name, None)
+    environment["AWS_SHARED_CREDENTIALS_FILE"] = os.devnull
+    environment["AWS_CONFIG_FILE"] = os.devnull
+    environment["AWS_EC2_METADATA_DISABLED"] = "true"
+    return environment
+
+
+def project_uses_jest(repository_path, strategy):
+    """The detected framework is a guess (MERN reports "Cypress / Jest").
+    Jest is only required when the test command runs it or the backend's
+    package.json declares it; otherwise tests use Node's built-in runner."""
+    test_command = strategy.get("test_command")
+    if isinstance(test_command, list) and any("jest" in str(part).lower() for part in test_command):
+        return True
+    package_path = os.path.join(repository_path, strategy.get("backend_path") or ".", "package.json")
+    try:
+        with open(package_path, "r", encoding="utf-8") as handle:
+            package = json.load(handle)
+    except (OSError, ValueError):
+        return False
+    return isinstance(package, dict) and any(
+        isinstance(package.get(section), dict) and "jest" in package[section]
+        for section in ("dependencies", "devDependencies")
+    )
+
+
+def local_execution_blockers(context):
+    repository_path = get_repository_path(context)
+    if not isinstance(repository_path, str) or not repository_path:
+        return ["Cannot preflight dependencies without a repository path."]
+
+    strategy = get_strategy(context)
+    blockers = []
+    test_framework = str(strategy.get("test_framework") or "").lower()
+    if "jest" in test_framework and project_uses_jest(repository_path, strategy):
+        backend_path = strategy.get("backend_path") or "."
+        test_command = strategy.get("test_command")
+        runner_relative = (
+            test_command[1]
+            if isinstance(test_command, list)
+            and len(test_command) > 1
+            and isinstance(test_command[1], str)
+            else os.path.join("node_modules", "jest", "bin", "jest.js")
+        )
+        runner_path = os.path.abspath(os.path.join(repository_path, runner_relative))
+        backend_runner = os.path.abspath(
+            os.path.join(
+                repository_path,
+                backend_path,
+                "node_modules",
+                "jest",
+                "bin",
+                "jest.js",
+            )
+        )
+        if not os.path.isfile(runner_path) and not os.path.isfile(backend_runner):
+            blockers.append(
+                f"Configured Jest runner is missing under '{backend_path}'; "
+                "package installation is disabled."
+            )
+
+    architecture = context.get("architecture", {})
+    components = architecture.get("components", []) if isinstance(architecture, dict) else []
+    for component in components:
+        if not isinstance(component, dict) or not component.get("build_command"):
+            continue
+        if str(component.get("package_manager") or "").lower() not in {
+            "npm",
+            "yarn",
+            "pnpm",
+        }:
+            continue
+        component_path = component.get("path") or "."
+        working_directory = os.path.abspath(
+            os.path.join(repository_path, component_path)
+        )
+        if (
+            os.path.isfile(os.path.join(working_directory, "package.json"))
+            and not os.path.isdir(os.path.join(working_directory, "node_modules"))
+        ):
+            blockers.append(
+                f"Build dependencies are missing for component "
+                f"'{component.get('name', component_path)}'; package installation is disabled."
+            )
+
+    return blockers
+
+
 def run_code_fix_stage():
-    if os.path.exists(CODE_FIX_RESULT_FILE):
-        os.remove(CODE_FIX_RESULT_FILE)
+    for path in (CODE_FIX_RESULT_FILE, CODE_FIX_ORIGINALS_FILE):
+        if os.path.exists(path):
+            os.remove(path)
 
     result = run_agent(
         AGENTS["code_fix"],
         [DIAGNOSIS_FILE],
     )
+    record_fix_baseline()
     return result, load_json(CODE_FIX_RESULT_FILE)
+
+
+def record_fix_baseline():
+    """Keep each file's content from before the FIRST fix attempt touched it,
+    so a reviewer sees the full change against the original code."""
+    originals = load_json(CODE_FIX_ORIGINALS_FILE)
+    if not isinstance(originals, dict) or not originals:
+        return
+    baseline = load_json(FIX_BASELINE_FILE)
+    baseline = baseline if isinstance(baseline, dict) else {}
+    for relative_path, original in originals.items():
+        if isinstance(relative_path, str) and relative_path not in baseline:
+            baseline[relative_path] = original if isinstance(original, str) else None
+    save_json(FIX_BASELINE_FILE, baseline)
+
+
+MAX_REVIEW_DIFF_CHARS = 40000
+
+
+def build_fix_diff(context):
+    """Unified diff of every fixed file: original (before any attempt) vs now."""
+    import difflib
+
+    baseline = load_json(FIX_BASELINE_FILE)
+    files, chunks, total, truncated = [], [], 0, False
+    for relative_path, original in sorted((baseline or {}).items()):
+        path = _repository_file(context, relative_path)
+        if path is None:
+            continue
+        try:
+            with open(path, "r", encoding="utf-8") as handle:
+                current = handle.read()
+        except OSError:
+            current = None
+        if current == original:
+            continue
+        diff_lines = list(difflib.unified_diff(
+            (original or "").splitlines(keepends=True),
+            (current or "").splitlines(keepends=True),
+            fromfile=f"a/{relative_path}" if original is not None else "/dev/null",
+            tofile=f"b/{relative_path}" if current is not None else "/dev/null",
+        ))
+        text = "".join(line if line.endswith("\n") else line + "\n" for line in diff_lines)
+        files.append({
+            "file": relative_path,
+            "added": sum(1 for line in diff_lines if line.startswith("+") and not line.startswith("+++")),
+            "removed": sum(1 for line in diff_lines if line.startswith("-") and not line.startswith("---")),
+        })
+        if total + len(text) > MAX_REVIEW_DIFF_CHARS:
+            truncated = True
+            text = text[: max(0, MAX_REVIEW_DIFF_CHARS - total)]
+        total += len(text)
+        chunks.append(text)
+    return {"files": files, "diff": "".join(chunks), "diff_truncated": truncated}
+
+
+def prompt_fix_review(fix_review):
+    """Terminal version of the fix review."""
+    try:
+        interactive = sys.stdin.isatty()
+    except (AttributeError, OSError):
+        interactive = False
+    if not interactive:
+        return None
+    print_header("FIX REVIEW: THE BUG WAS NOT CONFIRMED BY A TEST")
+    print(fix_review["reason"])
+    print(fix_review["diff"] or "(No file changes were recorded.)")
+    try:
+        answer = input("Approve this fix? [a]pprove / [r]eject: ").strip().lower()
+        if answer in ("a", "approve"):
+            return {"decision": "approve", "feedback": ""}
+        if answer in ("r", "reject"):
+            reason = input("Why is the fix rejected? ").strip()
+            return {"decision": "reject", "feedback": reason or "Rejected in the terminal."}
+    except (EOFError, KeyboardInterrupt):
+        pass
+    return None
+
+
+def review_unconfirmed_fix(context, checks):
+    """A fix for a bug that no automated test confirmed needs a human decision."""
+    fix_review = build_fix_diff(context)
+    fix_review.update({
+        "reason": (
+            "The bug was reproduced only from user-reported steps, not by an "
+            "automated test, so passing tests do not prove the reported bug is fixed."
+        ),
+        "checks": checks,
+    })
+    if control_enabled():
+        decision = wait_for_fix_review(fix_review)
+    else:
+        decision = prompt_fix_review(fix_review)
+    fix_review["decision"] = decision["decision"] if decision else None
+    fix_review["feedback"] = decision.get("feedback") if decision else None
+    fix_review["reviewed_by"] = "user" if decision else None
+    save_json(FIX_REVIEW_FILE, fix_review)
+    return fix_review
 
 
 # ============================================================
@@ -481,6 +763,64 @@ def validate_manual_reproduction():
 
 
 def collect_manual_reproduction(reproduction):
+    if control_enabled():
+        submission = wait_for_manual_reproduction(
+            recording_handler=handle_recording_submission
+        )
+        if submission is None:
+            return {
+                "status": "TIMED_OUT",
+                "reason": "Manual reproduction was not submitted before the wait timed out.",
+            }
+        if submission.get("kind") == "browser_recording":
+            return {
+                "status": "RECORDING_CONFIRMED",
+                "confirmed": submission["confirmed"],
+                "reason": (
+                    "The user's Playwright recording was replayed on the current code "
+                    "and a recorded assertion failed, which shows the bug."
+                ),
+            }
+        submission["automatic_reproduction_status"] = (
+            reproduction.get("status") if isinstance(reproduction, dict) else None
+        )
+        evidence_index = load_json(
+            os.path.join(ACTIVE_RUN_ARTIFACT_DIR or BASE_DIR, "evidence_index.json")
+        )
+        if isinstance(evidence_index, dict) and isinstance(evidence_index.get("files"), list):
+            # Redacted summaries of attached recordings/logs, for diagnosis.
+            submission["attached_evidence"] = [
+                {
+                    "name": item.get("name"),
+                    "kind": item.get("kind"),
+                    "summary": str(item.get("summary", ""))[:1500],
+                }
+                for item in evidence_index["files"][:5]
+                if isinstance(item, dict)
+            ]
+        artifact_path = resolve_artifact_path(
+            "manual_reproduction.json", BASE_DIR, ACTIVE_RUN_ARTIFACT_DIR
+        )
+        try:
+            with open(artifact_path, "x", encoding="utf-8") as file:
+                json.dump(submission, file, indent=4, ensure_ascii=False)
+        except FileExistsError:
+            return {
+                "status": "ARTIFACT_CONFLICT",
+                "artifact_path": artifact_path,
+                "reason": "Manual reproduction artifact already exists; it was not overwritten.",
+            }
+        except OSError as error:
+            return {
+                "status": "SAVE_FAILED",
+                "reason": f"Manual reproduction could not be saved: {error}",
+            }
+        return {
+            "status": "CAPTURED",
+            "artifact_path": artifact_path,
+            "reason": "Manual reproduction evidence was saved for initial and retry diagnosis.",
+        }
+
     try:
         interactive = sys.stdin.isatty()
     except (AttributeError, OSError):
@@ -517,17 +857,28 @@ def collect_manual_reproduction(reproduction):
                 break
             steps.append(step)
 
-        expected_behavior = input(
-            "Expected behavior ('cancel' to stop): "
-        ).strip()
-        if expected_behavior.lower() == "cancel":
-            return cancelled()
+        expected_behavior = ""
+        while not expected_behavior:
+            expected_behavior = input(
+                "Expected behavior (required; what should happen? "
+                "Enter 'unknown' if unclear, or 'cancel' to stop): "
+            ).strip()
+            if expected_behavior.lower() == "cancel":
+                return cancelled()
+            if not expected_behavior:
+                print("Please enter expected behavior, or type 'cancel'.")
 
-        observed_behavior = input(
-            "Observed behavior ('cancel' to stop): "
-        ).strip()
-        if observed_behavior.lower() == "cancel":
-            return cancelled()
+        observed_behavior = ""
+        while not observed_behavior:
+            observed_behavior = input(
+                "Observed behavior (required; what actually happened? "
+                "Enter 'not verified' if you have not run the steps, "
+                "or 'cancel' to stop): "
+            ).strip()
+            if observed_behavior.lower() == "cancel":
+                return cancelled()
+            if not observed_behavior:
+                print("Please enter the observed result, or type 'cancel'.")
 
         supporting_evidence = []
         while True:
@@ -593,10 +944,332 @@ def collect_manual_reproduction(reproduction):
         "status": "CAPTURED",
         "artifact_path": artifact_path,
         "reason": (
-            "Manual reproduction evidence was captured and validated. "
-            "The workflow can continue to diagnosis using the user-provided "
-            "reproduction steps and supporting evidence."
+            "Manual reproduction details were captured as user-reported "
+            "information; they are not automatically verified. The workflow "
+            "can continue to diagnosis using the submitted steps and outcomes."
         ),
+    }
+
+
+# ============================================================
+# AI REPRODUCTION TEST (human-confirmed)
+# ============================================================
+
+def _repository_file(context, relative_path):
+    repository = get_repository_path(context)
+    if not repository or not isinstance(relative_path, str):
+        return None
+    root = os.path.realpath(repository)
+    full = os.path.realpath(os.path.join(root, relative_path))
+    try:
+        return full if os.path.commonpath([root, full]) == root else None
+    except ValueError:
+        return None
+
+
+def remove_unconfirmed_reproduction_test(context, artifact):
+    """An unconfirmed AI test must not stay in the repository."""
+    if not isinstance(artifact, dict):
+        return
+    path = _repository_file(context, artifact.get("test_file"))
+    if path and os.path.isfile(path):
+        try:
+            with open(path, "r", encoding="utf-8") as handle:
+                current = handle.read()
+        except OSError:
+            return
+        if reproduction_tests.content_sha256(current) == artifact.get("content_sha256"):
+            os.remove(path)
+
+
+def prompt_reproduction_review(artifact):
+    """Terminal version of the review step."""
+    try:
+        interactive = sys.stdin.isatty()
+    except (AttributeError, OSError):
+        interactive = False
+    if not interactive:
+        return None
+    run = artifact.get("run") if isinstance(artifact.get("run"), dict) else {}
+    classification = artifact.get("classification")
+    print_header("AI REPRODUCTION TEST FOR REVIEW")
+    print(f"Test file: {artifact.get('test_file')}")
+    print(f"Result on current code: {classification}")
+    print("\n".join(str(artifact.get("content", "")).splitlines()[:80]))
+    print("\nRunner output (tail):\n" + str(run.get("output_tail", ""))[-1500:])
+    can_confirm = classification == reproduction_tests.FAILS_ON_CURRENT_CODE
+    choices = "[c]onfirm / [r]evise / [m]anual" if can_confirm else "[r]evise / [m]anual"
+    try:
+        answer = input(f"Does this test reproduce the bug? {choices}: ").strip().lower()
+        if answer in ("c", "confirm") and can_confirm:
+            return {"decision": "confirm", "feedback": ""}
+        if answer in ("r", "revise"):
+            feedback = input("What should the test do differently? ").strip()
+            if feedback:
+                return {"decision": "revise", "feedback": feedback[:4000]}
+    except (EOFError, KeyboardInterrupt):
+        pass
+    return {"decision": "manual", "feedback": ""}
+
+
+def collect_ai_reproduction_test(context):
+    """AI writes a reproduction test; a human confirms it before it is trusted.
+
+    Returns a dict whose status is CONFIRMED, MANUAL_REQUESTED, UNSUPPORTED,
+    UNAVAILABLE, EXHAUSTED, TIMED_OUT or NOT_OFFERED.
+    """
+    try:
+        interactive = sys.stdin.isatty()
+    except (AttributeError, OSError):
+        interactive = False
+    if not control_enabled() and not interactive:
+        return {"status": "NOT_OFFERED", "reason": "Reviewing an AI reproduction test needs the console or a terminal."}
+
+    rounds = []
+    feedback_arguments = []
+    for round_number in range(1, MAX_REPRODUCTION_TEST_ROUNDS + 1):
+        stage_name = f"AI Reproduction Test (Round {round_number})"
+        print_stage(2, stage_name)
+        if os.path.exists(REPRODUCTION_TEST_FILE):
+            os.remove(REPRODUCTION_TEST_FILE)
+        # Recordings and logs the user attached (re-read every round, so
+        # files added during review are used by the revision).
+        evidence_index = os.path.join(ACTIVE_RUN_ARTIFACT_DIR or BASE_DIR, "evidence_index.json")
+        evidence_arguments = ["--evidence", evidence_index] if os.path.isfile(evidence_index) else []
+        result = run_agent(
+            AGENTS["reproduction_test"],
+            ["--round", str(round_number)] + feedback_arguments + evidence_arguments,
+        )
+        artifact = load_json(REPRODUCTION_TEST_FILE)
+        if isinstance(artifact, dict) and artifact.get("status") == "UNSUPPORTED":
+            record_stage(2, stage_name, "SKIPPED")
+            return {"status": "UNSUPPORTED", "reason": artifact.get("reason"), "rounds": rounds}
+        if not result["success"] or not isinstance(artifact, dict) or artifact.get("status") != "GENERATED":
+            reason = (artifact or {}).get("reason") if isinstance(artifact, dict) else None
+            rounds.append({"round": round_number, "status": "NOT_GENERATED", "reason": reason})
+            record_stage(2, stage_name, "FAILED")
+            return {"status": "UNAVAILABLE", "reason": reason or "The AI could not produce a reproduction test.", "rounds": rounds}
+
+        record = {
+            "round": round_number,
+            "test_file": artifact.get("test_file"),
+            "classification": artifact.get("classification"),
+        }
+        if control_enabled():
+            decision = wait_for_reproduction_review(artifact, round_number, MAX_REPRODUCTION_TEST_ROUNDS)
+        else:
+            decision = prompt_reproduction_review(artifact)
+        if decision is None:
+            remove_unconfirmed_reproduction_test(context, artifact)
+            rounds.append(dict(record, decision="timed_out"))
+            record_stage(2, stage_name, "TIMED_OUT")
+            return {"status": "TIMED_OUT", "reason": "The reproduction test was not reviewed in time.", "rounds": rounds}
+
+        record.update(decision=decision["decision"], feedback=decision.get("feedback") or None)
+        rounds.append(record)
+
+        if decision["decision"] == "confirm":
+            if artifact.get("classification") != reproduction_tests.FAILS_ON_CURRENT_CODE:
+                record["decision"] = "confirm_rejected"
+                record_stage(2, stage_name, "FAILED")
+                remove_unconfirmed_reproduction_test(context, artifact)
+                return {"status": "UNAVAILABLE", "reason": "Only a test that fails on the current code can be confirmed.", "rounds": rounds}
+            confirmed = {
+                "status": "CONFIRMED",
+                "confirmed_by": "user",
+                "round": round_number,
+                "framework": artifact.get("framework"),
+                "test_file": artifact.get("test_file"),
+                "content": artifact.get("content"),
+                "content_sha256": artifact.get("content_sha256"),
+                "before_fix": {
+                    "classification": artifact.get("classification"),
+                    "run": artifact.get("run"),
+                },
+            }
+            save_json(CONFIRMED_REPRODUCTION_TEST_FILE, confirmed)
+            record_stage(2, stage_name, "CONFIRMED")
+            return {"status": "CONFIRMED", "confirmed": confirmed, "rounds": rounds}
+
+        remove_unconfirmed_reproduction_test(context, artifact)
+        if decision["decision"] == "manual":
+            record_stage(2, stage_name, "MANUAL_REQUESTED")
+            return {"status": "MANUAL_REQUESTED", "rounds": rounds}
+        record_stage(2, stage_name, "REVISED")
+
+        save_json(REPRODUCTION_TEST_FEEDBACK_FILE, {
+            "previous_content": artifact.get("content"),
+            "previous_classification": artifact.get("classification"),
+            "previous_output": (artifact.get("run") or {}).get("output_tail"),
+            "feedback": decision.get("feedback"),
+        })
+        feedback_arguments = ["--feedback", REPRODUCTION_TEST_FEEDBACK_FILE]
+
+    return {"status": "EXHAUSTED", "reason": "No reproduction test was confirmed.", "rounds": rounds}
+
+
+def run_confirmed_reproduction_test(context):
+    """After the fix, the unchanged confirmed test must pass."""
+    confirmed = load_json(CONFIRMED_REPRODUCTION_TEST_FILE)
+    runner = reproduction_tests.select_runner(context)
+    if not isinstance(confirmed, dict) or runner is None:
+        return {"status": "FAILED", "reason": "The confirmed reproduction test is unavailable."}
+    path = _repository_file(context, confirmed.get("test_file"))
+    if path is None or confirmed.get("test_file") != runner["test_path"]:
+        return {"status": "FAILED", "reason": "The confirmed reproduction test path is invalid."}
+    try:
+        with open(path, "r", encoding="utf-8") as handle:
+            current = handle.read()
+    except OSError:
+        current = None
+    # The fix must not change the test; restore the confirmed version if it did.
+    restored = reproduction_tests.content_sha256(current) != confirmed.get("content_sha256")
+    if restored:
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        with open(path, "w", encoding="utf-8", newline="\n") as handle:
+            handle.write(confirmed.get("content") or "")
+    run = reproduction_tests.run_single_test(get_repository_path(context), runner)
+    passed = reproduction_tests.passes_after_fix(run)
+    return {
+        "status": "PASSED" if passed else "FAILED",
+        "test_file": confirmed.get("test_file"),
+        "test_restored_before_run": restored,
+        "classification": reproduction_tests.classify_run(run),
+        "run": run,
+    }
+
+
+def run_artifact_path(filename):
+    return resolve_artifact_path(filename, BASE_DIR, ACTIVE_RUN_ARTIFACT_DIR)
+
+
+def confirmed_reproduction_file(source):
+    if source == BROWSER_RECORDING_SOURCE:
+        return run_artifact_path("confirmed_browser_recording.json")
+    return CONFIRMED_REPRODUCTION_TEST_FILE
+
+
+def run_browser_replay(recording_path, name):
+    """Start the app, replay the recording's steps, stop the app."""
+    output_path = run_artifact_path(f"{name}.json")
+    if os.path.exists(output_path):
+        os.remove(output_path)
+    run_agent(
+        AGENTS["browser_replay"],
+        [
+            "--recording", recording_path,
+            "--output", output_path,
+            "--screenshot", run_artifact_path(f"{name}_failure.png"),
+        ],
+    )
+    result = load_json(output_path)
+    if not isinstance(result, dict) or not isinstance(result.get("classification"), str):
+        return {"classification": "ERROR", "summary": "The browser replay did not produce a result."}
+    return result
+
+
+def handle_recording_submission(submission):
+    """Validate and replay an uploaded Playwright recording on the current code.
+
+    Returns (confirmed, feedback). It is confirmed only when a recorded
+    assertion fails, which shows the bug; the user wrote that assertion.
+    """
+    filename = submission["filename"]
+    try:
+        parsed = browser_recording.parse_recording(submission["content"], filename)
+    except browser_recording.RecordingError as error:
+        return None, {
+            "kind": "recording_result",
+            "filename": filename,
+            "classification": "REJECTED",
+            "summary": "The recording was rejected: " + "; ".join(error.errors),
+            "steps": [],
+        }
+
+    candidate_path = run_artifact_path("browser_recording.json")
+    save_json(candidate_path, dict(parsed, filename=filename))
+    publish_workflow_state(
+        "REPLAYING_RECORDING",
+        "Bug Reproduction",
+        f"Starting the app and replaying {filename} on the current code.",
+        None,
+        ["stop_safely"],
+    )
+    result = run_browser_replay(candidate_path, "browser_replay_before_fix")
+    result["filename"] = filename
+    feedback = recording_feedback(result)
+    if result["classification"] != reproduction_tests.FAILS_ON_CURRENT_CODE:
+        if result["classification"] == reproduction_tests.PASSES_ON_CURRENT_CODE:
+            feedback["summary"] = (
+                "Every recorded step and assertion passed on the current code, so the "
+                "recording does not show the bug. Record an assertion for the correct "
+                "behaviour that the bug breaks."
+            )
+        return None, feedback
+
+    content = submission["content"]
+    confirmed = {
+        "status": "CONFIRMED",
+        "confirmed_by": "user",
+        "source": BROWSER_RECORDING_SOURCE,
+        "framework": "playwright-recording",
+        "test_file": filename,
+        "content": content,
+        "content_sha256": reproduction_tests.content_sha256(content),
+        "language": parsed["language"],
+        "recorded_origin": parsed["recorded_origin"],
+        "steps": parsed["steps"],
+        "before_fix": {
+            "classification": result["classification"],
+            "summary": result.get("summary"),
+            "run": {"output_tail": result.get("summary"), "steps": feedback["steps"]},
+        },
+    }
+    save_json(run_artifact_path("confirmed_browser_recording.json"), confirmed)
+    return confirmed, feedback
+
+
+def record_browser_replay_as_runtime_validation(rerun, attempt):
+    """The replay started the fixed app and drove it over HTTP in a browser,
+    so a passing replay is the HTTP runtime validation that fix verification
+    requires. A failed replay must not leave an older passing result behind."""
+    if rerun.get("status") != "PASSED":
+        if os.path.exists(VALIDATION_RESULT_FILE):
+            os.remove(VALIDATION_RESULT_FILE)
+        return
+    save_json(VALIDATION_RESULT_FILE, {
+        "status": "PASSED",
+        "return_code": 0,
+        "source": BROWSER_RECORDING_SOURCE,
+        "message": (
+            "The confirmed browser recording was replayed on the freshly started, "
+            "fixed app; every recorded step and assertion passed."
+        ),
+        "checks": [{
+            "name": "Browser recording replay",
+            "kind": "runtime",
+            "status": "PASSED",
+            "return_code": 0,
+            "command": ["node", "browser_replay/replay.mjs", str(rerun.get("test_file"))],
+            "replay_result_ref": f"browser_replay_after_fix_attempt_{attempt}.json",
+        }],
+    })
+
+
+def run_confirmed_browser_recording(attempt):
+    """After the fix, every recorded step and assertion must pass."""
+    path = run_artifact_path("confirmed_browser_recording.json")
+    confirmed = load_json(path)
+    if not isinstance(confirmed, dict) or confirmed.get("status") != "CONFIRMED":
+        return {"status": "FAILED", "reason": "The confirmed browser recording is unavailable."}
+    result = run_browser_replay(path, f"browser_replay_after_fix_attempt_{attempt}")
+    passed = result["classification"] == reproduction_tests.PASSES_ON_CURRENT_CODE
+    return {
+        "status": "PASSED" if passed else "FAILED",
+        "test_file": confirmed.get("test_file"),
+        "classification": result["classification"],
+        "summary": result.get("summary"),
+        "replay": result.get("replay"),
     }
 
 
@@ -607,24 +1280,10 @@ def collect_manual_reproduction(reproduction):
 
 def validate_diagnosis():
     diagnosis = load_json(DIAGNOSIS_FILE)
-
-    if not isinstance(diagnosis, dict):
-        return False
-
-    required_fields = (
-        "bug_title",
-        "project_type",
-        "failure_analysis",
-        "root_cause",
-        "affected_files",
-        "evidence",
-        "proposed_fix",
-        "verification_plan",
-    )
-
-    return all(
-        field in diagnosis
-        for field in required_fields
+    manual_reproduction = load_json(MANUAL_REPRODUCTION_FILE)
+    return not diagnosis_validation_errors(
+        diagnosis,
+        manual_reproduction if isinstance(manual_reproduction, dict) else None,
     )
 
 
@@ -634,24 +1293,7 @@ def validate_diagnosis():
 
 def validate_test_result():
     result = load_json(TEST_RESULT_FILE)
-
-    if not isinstance(result, dict):
-        return False
-
-    if (
-        result.get("status") not in ("PASSED", "PASS", "SUCCESS")
-        or result.get("return_code") != 0
-    ):
-        return False
-
-    tests = result.get("tests")
-    passed = result.get("passed")
-    failed = result.get("failed")
-
-    if all(isinstance(value, int) for value in (tests, passed, failed)):
-        return tests > 0 and passed == tests and failed == 0
-
-    return True
+    return test_result_has_success_evidence(result)
 
 
 def command_parts(command):
@@ -713,42 +1355,41 @@ def run_component_builds(context):
             "yarn": "yarn.lock",
             "pnpm": "pnpm-lock.yaml",
         }
-        install_command = None
+        install_required = False
         if package_manager in lockfiles:
             lockfile_path = os.path.join(working_directory, lockfiles[package_manager])
             if os.path.isfile(lockfile_path):
-                install_command = [package_manager, "ci"] if package_manager == "npm" else [package_manager, "install", "--frozen-lockfile"]
+                install_required = True
             elif os.path.isfile(os.path.join(working_directory, "package.json")):
-                install_command = [package_manager, "install"]
+                install_required = True
+
+        if install_required:
+            dependency_directory = os.path.join(working_directory, "node_modules")
+            if not os.path.isdir(dependency_directory):
+                results.append({
+                    "component": component.get("name"),
+                    "path": component_path,
+                    "status": "BLOCKED",
+                    "return_code": None,
+                    "reason": (
+                        "Local dependencies are missing; automatic package "
+                        "installation is disabled."
+                    ),
+                })
+                continue
 
         try:
-            if install_command:
-                install_parts = command_parts(install_command)
-                install_result = subprocess.run(
-                    install_parts,
-                    cwd=working_directory,
-                    capture_output=True,
-                    text=True,
-                    check=False,
-                )
-                if install_result.returncode != 0:
-                    results.append({
-                        "component": component.get("name"),
-                        "status": "FAILED",
-                        "return_code": install_result.returncode,
-                        "command": " ".join(install_parts),
-                        "stdout": install_result.stdout or "",
-                        "stderr": install_result.stderr or "",
-                    })
-                    continue
-
             build_parts = command_parts(component["build_command"])
-            build_result = subprocess.run(
+            build_result = run_bounded(
                 build_parts,
+                timeout=BUILD_COMMAND_TIMEOUT_SECONDS,
                 cwd=working_directory,
                 capture_output=True,
                 text=True,
+                encoding="utf-8",
+                errors="replace",
                 check=False,
+                env=project_process_environment(),
             )
             results.append({
                 "component": component.get("name"),
@@ -777,8 +1418,9 @@ def run_component_builds(context):
         }
     else:
         successful = all(item.get("status") == "PASSED" for item in results)
+        blocked = any(item.get("status") == "BLOCKED" for item in results)
         aggregate = {
-            "status": "PASSED" if successful else "FAILED",
+            "status": "BLOCKED" if blocked else "PASSED" if successful else "FAILED",
             "return_code": 0 if successful else 1,
             "components": results,
         }
@@ -787,7 +1429,7 @@ def run_component_builds(context):
     return aggregate
 
 
-def run_validation_only(context):
+def run_validation_only(context, include_backend_tests=True):
     repository_path = os.path.realpath(get_repository_path(context) or "")
     architecture = context.get("architecture", {})
     components = architecture.get("components", []) if isinstance(architecture, dict) else []
@@ -817,9 +1459,12 @@ def run_validation_only(context):
         else:
             setup_errors.append("Frontend npm run lint command was not detected.")
 
-    if backend is None:
+    if include_backend_tests and backend is None:
         setup_errors.append("No backend component was detected.")
-    elif str(backend.get("test_framework") or "").lower() == "jest":
+    elif (
+        include_backend_tests
+        and str(backend.get("test_framework") or "").lower() == "jest"
+    ):
         jest_command = backend.get("test_command")
         component_path = backend.get("path") or "."
         backend_directory = os.path.realpath(
@@ -844,7 +1489,7 @@ def run_validation_only(context):
             ))
         else:
             setup_errors.append("Installed local Jest runner was not detected.")
-    else:
+    elif include_backend_tests:
         setup_errors.append("Backend Jest test framework was not detected.")
 
     check_results = []
@@ -870,13 +1515,16 @@ def run_validation_only(context):
 
         command_args = command_parts(command)
         try:
-            process = subprocess.run(
+            process = run_bounded(
                 command_args,
+                timeout=BUILD_COMMAND_TIMEOUT_SECONDS,
                 cwd=working_directory,
                 capture_output=True,
                 text=True,
+                encoding="utf-8",
+                errors="replace",
                 check=False,
-                env={**os.environ, "npm_config_offline": "true"},
+                env=project_process_environment(),
             )
             check_results.append({
                 "name": check_name,
@@ -914,7 +1562,7 @@ def run_validation_only(context):
     checks_passed = (
         not setup_errors
         and len(build_checks) == 1
-        and len(test_checks) == 2
+        and len(test_checks) == (2 if include_backend_tests else 1)
         and all(item.get("status") == "PASSED" for item in check_results)
     )
     return_code = 0 if checks_passed else 1
@@ -1036,7 +1684,44 @@ def validate_verification():
         "PASS",
         "PASSED",
         "SUCCESS"
+    ) or report.get("return_code") != 0:
+        return False
+
+    current_test_result = load_json(TEST_RESULT_FILE)
+    if (
+        not test_result_has_success_evidence(report.get("test_result"))
+        or report.get("test_result") != current_test_result
     ):
+        return False
+
+    context = load_json(REPOSITORY_CONTEXT_FILE) or {}
+    strategy = get_strategy(context)
+    architecture = context.get("architecture", {})
+    components = architecture.get("components", []) if isinstance(architecture, dict) else []
+    build_components = [
+        component
+        for component in components
+        if isinstance(component, dict) and component.get("build_command")
+    ]
+    expected_builds = len(build_components) if build_components else int(
+        bool(strategy.get("build_command"))
+    )
+    if expected_builds:
+        current_build = load_json(BUILD_RESULT_FILE)
+        if (
+            report.get("build_result") != current_build
+            or not build_result_has_success_evidence(current_build, expected_builds)
+        ):
+            return False
+
+    current_validation = load_json(VALIDATION_RESULT_FILE)
+    if report.get("validation_result") != current_validation:
+        return False
+    validation_method = strategy.get("validation_method")
+    if current_validation is None:
+        if "http" in str(validation_method or "").lower():
+            return False
+    elif not runtime_result_has_success_evidence(current_validation):
         return False
 
     return True
@@ -1064,6 +1749,8 @@ def add_stage_result(
         item["details"] = details
 
     stage_results.append(item)
+    if control_enabled() and stage is not None:
+        record_stage(stage, name, status)
 
 
 # ============================================================
@@ -1130,7 +1817,7 @@ def create_retry_bug_report(
 
 
 def load_retry_failure_context():
-    return {
+    failure_context = {
         "previous_reproduction_result": load_json(REPRODUCTION_RESULT_FILE),
         "manual_reproduction": load_json(MANUAL_REPRODUCTION_FILE),
         "previous_test_generation_result": load_json(TEST_GENERATION_RESULT_FILE),
@@ -1141,6 +1828,13 @@ def load_retry_failure_context():
         "previous_verification_result": load_json(VERIFICATION_REPORT_FILE),
         "previous_diagnosis": load_json(DIAGNOSIS_FILE),
     }
+    confirmed_test = load_json(CONFIRMED_REPRODUCTION_TEST_FILE)
+    if confirmed_test is not None:
+        failure_context["confirmed_reproduction_test"] = confirmed_test
+    confirmed_recording = load_json(run_artifact_path("confirmed_browser_recording.json"))
+    if confirmed_recording is not None:
+        failure_context["confirmed_browser_recording"] = confirmed_recording
+    return failure_context
 
 
 # ============================================================
@@ -1211,6 +1905,8 @@ def create_workflow_report(
         ),
 
         "final_status": final_status,
+        "deployment_status": "NOT_DEPLOYED",
+        "deployment_readiness": "NOT_ASSESSED",
     }
 
     if reproduction_source:
@@ -1236,6 +1932,40 @@ def create_workflow_report(
                 else []
             ),
         }
+        evidence_index = load_json(
+            os.path.join(ACTIVE_RUN_ARTIFACT_DIR or BASE_DIR, "evidence_index.json")
+        )
+        if isinstance(evidence_index, dict) and isinstance(evidence_index.get("files"), list):
+            report["reproduction_evidence"]["attached_files"] = [
+                {key: item.get(key) for key in ("name", "stored_as", "kind", "bytes", "sha256", "redacted")}
+                for item in evidence_index["files"]
+                if isinstance(item, dict)
+            ]
+        if reproduction_source == AI_REPRODUCTION_SOURCE:
+            confirmed = load_json(CONFIRMED_REPRODUCTION_TEST_FILE)
+            report["reproduction_evidence"].update({
+                "confirmed_test_ref": os.path.relpath(
+                    CONFIRMED_REPRODUCTION_TEST_FILE,
+                    ACTIVE_RUN_ARTIFACT_DIR or BASE_DIR,
+                ),
+                "confirmed_test_file": (confirmed or {}).get("test_file"),
+                "before_fix": ((confirmed or {}).get("before_fix") or {}).get("classification"),
+                "confirmed_by": (confirmed or {}).get("confirmed_by"),
+            })
+        if reproduction_source == BROWSER_RECORDING_SOURCE:
+            recording_path = confirmed_reproduction_file(BROWSER_RECORDING_SOURCE)
+            confirmed = load_json(recording_path) or {}
+            report["reproduction_evidence"].update({
+                "confirmed_recording_ref": os.path.relpath(
+                    recording_path,
+                    ACTIVE_RUN_ARTIFACT_DIR or BASE_DIR,
+                ),
+                "recording_file": confirmed.get("test_file"),
+                "recording_sha256": confirmed.get("content_sha256"),
+                "recording_steps": len(confirmed.get("steps") or []),
+                "before_fix": (confirmed.get("before_fix") or {}).get("classification"),
+                "confirmed_by": confirmed.get("confirmed_by"),
+            })
 
     save_json(
         WORKFLOW_REPORT_FILE,
@@ -1253,6 +1983,7 @@ def _run_workflow():
 
     global ACTIVE_BUG_REPORT_FILE
     global ACTIVE_RUN_ARTIFACT_DIR
+    global ACTIVE_WORKFLOW_PROGRESS
     global CHILD_ENV_OVERRIDES
 
     arguments = parse_workflow_arguments()
@@ -1272,7 +2003,21 @@ def _run_workflow():
         CHILD_ENV_OVERRIDES["GITHUB_REPOSITORY_URL"] = repository_url
     if local_repository_path:
         CHILD_ENV_OVERRIDES["LOCAL_REPOSITORY_PATH"] = local_repository_path
-    configure_run_artifact_paths(create_run_artifact_dir())
+    if control_enabled():
+        requested_run_directory = os.path.realpath(
+            os.environ.get(WORKFLOW_RUN_DIRECTORY_ENV, "")
+        )
+        current_control_directory = control_directory()
+        if (
+            not requested_run_directory
+            or current_control_directory is None
+            or os.path.realpath(os.path.dirname(current_control_directory))
+            != requested_run_directory
+        ):
+            raise ValueError("The UI workflow artifact directory is invalid.")
+        configure_run_artifact_paths(requested_run_directory)
+    else:
+        configure_run_artifact_paths(create_run_artifact_dir())
 
     print_header(
         "AI AGENTIC SOFTWARE DEBUGGING WORKFLOW"
@@ -1280,8 +2025,16 @@ def _run_workflow():
 
     stage_results = []
     retry_history = []
+    ACTIVE_WORKFLOW_PROGRESS = {
+        "stage_results": stage_results,
+        "retry_history": retry_history,
+        "context": {},
+        "reproduction_source": None,
+    }
 
     workflow_failed = False
+    workflow_blocked = False
+    workflow_stopped = False
     final_status = "FAIL"
     tests_passed = False
     builds_passed = False
@@ -1291,9 +2044,12 @@ def _run_workflow():
     context = {}
     initial_reproduction = None
     reproduction_source = None
+    ai_reproduction = {"status": None}
+    ai_summary = {}
     tests_passed = False
     builds_passed = False
     runtime_passed = False
+    reproduction_test_passed = False
 
 
     # ========================================================
@@ -1316,6 +2072,8 @@ def _run_workflow():
     context_valid, context_error = validate_context(
         context
     )
+    if isinstance(context, dict):
+        ACTIVE_WORKFLOW_PROGRESS["context"] = context
 
     if result["success"] and context_valid:
 
@@ -1388,7 +2146,7 @@ def _run_workflow():
 
     if arguments.local_websocket_demo:
         preflight_result = (
-            run_validation_only(context)
+            run_validation_only(context, include_backend_tests=False)
             if result["success"] and context_valid
             else {
                 "status": "FAILED",
@@ -1569,12 +2327,97 @@ def _run_workflow():
             workflow_failed = True
 
         else:
+            # First let the AI write a reproduction test that a human
+            # confirms; typed steps are the fallback.
+            ai_reproduction = collect_ai_reproduction_test(
+                context if isinstance(context, dict) else {}
+            )
+            ai_summary = {
+                key: ai_reproduction.get(key)
+                for key in ("status", "reason", "rounds")
+                if ai_reproduction.get(key) is not None
+            }
+        if (
+            not workflow_failed
+            and reproduction_source is None
+            and not automatic_reproduction_confirmed
+            and ai_reproduction["status"] == "CONFIRMED"
+        ):
+            reproduction_source = AI_REPRODUCTION_SOURCE
+            confirmed = ai_reproduction["confirmed"]
+            add_stage_result(
+                stage_results,
+                2,
+                "Bug Reproduction",
+                "TEST_CONFIRMED",
+                {
+                    "status": (
+                        reproduction.get("status")
+                        if isinstance(reproduction, dict)
+                        else None
+                    ),
+                    "reason": (
+                        "A user confirmed that the AI-written test reproduces the bug; "
+                        "it fails on the current code."
+                    ),
+                    "reproduction_test": {
+                        "test_file": confirmed.get("test_file"),
+                        "framework": confirmed.get("framework"),
+                        "round": confirmed.get("round"),
+                        "before_fix": confirmed["before_fix"].get("classification"),
+                    },
+                    "ai_reproduction_test": ai_summary,
+                },
+            )
+        elif (
+            not workflow_failed
+            and reproduction_source is None
+            and not automatic_reproduction_confirmed
+            and ai_reproduction["status"] == "TIMED_OUT"
+        ):
+            add_stage_result(
+                stage_results,
+                2,
+                "Bug Reproduction",
+                "FAILED",
+                {"reason": ai_reproduction["reason"], "ai_reproduction_test": ai_summary},
+            )
+            workflow_failed = True
+        elif (
+            not workflow_failed
+            and reproduction_source is None
+            and not automatic_reproduction_confirmed
+        ):
             manual_fallback = collect_manual_reproduction(reproduction)
             manual_context_valid = (
                 manual_fallback["status"] == "CAPTURED"
                 and validate_manual_reproduction()
             )
-            if manual_context_valid:
+            if manual_fallback["status"] == "RECORDING_CONFIRMED":
+                reproduction_source = BROWSER_RECORDING_SOURCE
+                confirmed = manual_fallback["confirmed"]
+                add_stage_result(
+                    stage_results,
+                    2,
+                    "Bug Reproduction",
+                    "RECORDING_CONFIRMED",
+                    {
+                        "status": (
+                            reproduction.get("status")
+                            if isinstance(reproduction, dict)
+                            else None
+                        ),
+                        "reason": manual_fallback["reason"],
+                        "browser_recording": {
+                            "file": confirmed.get("test_file"),
+                            "steps": len(confirmed.get("steps") or []),
+                            "before_fix": confirmed["before_fix"].get("classification"),
+                            "summary": confirmed["before_fix"].get("summary"),
+                        },
+                        "ai_reproduction_test": ai_summary,
+                    },
+                )
+            elif manual_context_valid:
                 reproduction_source = "manual"
                 add_stage_result(
                     stage_results,
@@ -1589,6 +2432,7 @@ def _run_workflow():
                         ),
                         "reason": manual_fallback["reason"],
                         "manual_fallback": manual_fallback,
+                        "ai_reproduction_test": ai_summary,
                     },
                 )
             else:
@@ -1614,6 +2458,7 @@ def _run_workflow():
                         ),
                         "reason": failure_reason,
                         "manual_fallback": manual_fallback,
+                        "ai_reproduction_test": ai_summary,
                     },
                 )
                 workflow_failed = True
@@ -1622,6 +2467,8 @@ def _run_workflow():
     # ========================================================
     # STAGE 3 - INITIAL DIAGNOSIS
     # ========================================================
+
+    ACTIVE_WORKFLOW_PROGRESS["reproduction_source"] = reproduction_source
 
     if not workflow_failed:
 
@@ -1640,6 +2487,8 @@ def _run_workflow():
         diagnosis_arguments = (
             ["--manual-reproduction", MANUAL_REPRODUCTION_FILE]
             if reproduction_source == "manual"
+            else ["--reproduction-test", confirmed_reproduction_file(reproduction_source)]
+            if reproduction_source in (AI_REPRODUCTION_SOURCE, BROWSER_RECORDING_SOURCE)
             else None
         )
         result = run_agent(
@@ -1710,8 +2559,48 @@ def _run_workflow():
 
     attempt = 0
 
+    if not workflow_failed:
+        execution_blockers = local_execution_blockers(context)
+        blocker_attempts = 0
+        while execution_blockers and control_enabled():
+            remaining_retries = MAX_RETRIES - blocker_attempts
+            allowed_actions = ["continue", "stop_safely"]
+            if remaining_retries > 0:
+                allowed_actions.insert(0, "retry")
+            action = wait_for_blocker_action(
+                "Pre-fix Local Dependency Preflight",
+                "; ".join(execution_blockers),
+                MAX_RETRIES,
+                allowed_actions=allowed_actions,
+            )
+            if action == "stop":
+                workflow_stopped = True
+                break
+            blocker_attempts += 1
+            execution_blockers = local_execution_blockers(context)
+        if execution_blockers:
+            workflow_blocked = not workflow_stopped
+            add_stage_result(
+                stage_results,
+                4,
+                "Pre-fix Local Dependency Preflight",
+                "STOPPED" if workflow_stopped else "BLOCKED",
+                {"blockers": execution_blockers},
+            )
+            retry_history.append({
+                "attempt": 0,
+                "overall": "STOPPED" if workflow_stopped else "BLOCKED",
+                "reason": (
+                    "Workflow stopped safely before any later stage started."
+                    if workflow_stopped
+                    else "Required local test/build dependencies remain unavailable."
+                ),
+            })
+
     while (
         not workflow_failed
+        and not workflow_blocked
+        and not workflow_stopped
         and attempt <= MAX_RETRIES
     ):
 
@@ -1752,6 +2641,11 @@ def _run_workflow():
                 diagnosis_arguments.extend([
                     "--manual-reproduction",
                     MANUAL_REPRODUCTION_FILE,
+                ])
+            elif reproduction_source in (AI_REPRODUCTION_SOURCE, BROWSER_RECORDING_SOURCE):
+                diagnosis_arguments.extend([
+                    "--reproduction-test",
+                    confirmed_reproduction_file(reproduction_source),
                 ])
             result = run_agent(
                 AGENTS["bug_diagnosis"],
@@ -1970,11 +2864,18 @@ def _run_workflow():
             "PASSED",
             "SKIPPED",
         )
+        build_stage_status = (
+            "BLOCKED"
+            if build_result.get("status") == "BLOCKED"
+            else "SUCCESS"
+            if builds_passed
+            else "FAILED"
+        )
         add_stage_result(
             stage_results,
             6,
             f"Component Build Validation (Attempt {attempt})",
-            "SUCCESS" if builds_passed else "FAILED",
+            build_stage_status,
             build_result,
         )
 
@@ -1998,6 +2899,44 @@ def _run_workflow():
             "SUCCESS" if runtime_passed else "FAILED",
             runtime_validation,
         )
+
+        # The human-confirmed reproduction test failed before the fix;
+        # it must now pass, unchanged.
+        if reproduction_source == AI_REPRODUCTION_SOURCE:
+            print_stage(
+                6,
+                f"Reproduction Test Re-run (Attempt {attempt})",
+            )
+            reproduction_rerun = run_confirmed_reproduction_test(
+                context if isinstance(context, dict) else {}
+            )
+            reproduction_test_passed = reproduction_rerun["status"] == "PASSED"
+            add_stage_result(
+                stage_results,
+                6,
+                f"Reproduction Test Re-run (Attempt {attempt})",
+                "SUCCESS" if reproduction_test_passed else "FAILED",
+                reproduction_rerun,
+            )
+        elif reproduction_source == BROWSER_RECORDING_SOURCE:
+            # The user's recording showed the bug before the fix; replayed
+            # on the fixed app, every step and assertion must now pass.
+            print_stage(
+                6,
+                f"Browser Recording Replay (Attempt {attempt})",
+            )
+            reproduction_rerun = run_confirmed_browser_recording(attempt)
+            reproduction_test_passed = reproduction_rerun["status"] == "PASSED"
+            record_browser_replay_as_runtime_validation(reproduction_rerun, attempt)
+            add_stage_result(
+                stage_results,
+                6,
+                f"Browser Recording Replay (Attempt {attempt})",
+                "SUCCESS" if reproduction_test_passed else "FAILED",
+                reproduction_rerun,
+            )
+        else:
+            reproduction_test_passed = True
 
         add_stage_result(
             stage_results,
@@ -2062,6 +3001,7 @@ def _run_workflow():
             tests_passed
             and builds_passed
             and runtime_passed
+            and reproduction_test_passed
             and verification_passed
         )
 
@@ -2093,6 +3033,12 @@ def _run_workflow():
                     else "FAIL"
                 ),
 
+                "reproduction_test": (
+                    ("PASS" if reproduction_test_passed else "FAIL")
+                    if reproduction_source in (AI_REPRODUCTION_SOURCE, BROWSER_RECORDING_SOURCE)
+                    else "NOT_APPLICABLE"
+                ),
+
                 "overall": (
                     "PASS"
                     if attempt_passed
@@ -2110,6 +3056,17 @@ def _run_workflow():
 
             final_status = "PASS"
             break
+
+        if control_enabled() and attempt < MAX_RETRIES + 1:
+            action = wait_for_blocker_action(
+                "Fix Verification",
+                "Test, build, runtime, or fix verification did not pass.",
+                MAX_RETRIES,
+                allowed_actions=["retry", "stop_safely"],
+            )
+            if action == "stop":
+                workflow_stopped = True
+                break
 
 
         # ====================================================
@@ -2138,17 +3095,54 @@ def _run_workflow():
     )
 
     final_status = (
-        "PASS"
+        "STOPPED"
+        if workflow_stopped
+        else "BLOCKED"
+        if workflow_blocked
+        else "PASS"
         if (
             not workflow_failed
             and validate_test_result()
             and builds_passed
             and runtime_passed
+            and reproduction_test_passed
             and verification_passed
             and validate_verification()
         )
         else "FAIL"
     )
+
+    # A bug that was never confirmed by an automated test (user-reported
+    # steps only) is not proven fixed by passing tests: a human must approve.
+    fix_review = None
+    reproduction_confirmed = reproduction_source in CONFIRMED_SOURCES
+    if final_status == "PASS" and reproduction_source == "manual":
+        print_stage(8, "Human Fix Review")
+        fix_review = review_unconfirmed_fix(
+            context if isinstance(context, dict) else {},
+            {
+                "tests": "PASS" if tests_passed else "FAIL",
+                "build": "PASS" if builds_passed else "FAIL",
+                "runtime_validation": "PASS" if runtime_passed else "FAIL",
+                "verification": "PASS" if verification_passed else "FAIL",
+            },
+        )
+        if fix_review["decision"] == "approve":
+            review_status, final_status = "SUCCESS", "PASS"
+        elif fix_review["decision"] == "reject":
+            review_status, final_status = "FAILED", "FAIL"
+        else:
+            review_status, final_status = "SKIPPED", "UNCONFIRMED"
+        add_stage_result(
+            stage_results,
+            8,
+            "Human Fix Review",
+            review_status,
+            {
+                key: fix_review.get(key)
+                for key in ("decision", "feedback", "reviewed_by", "files", "diff_truncated")
+            },
+        )
 
 
     # ========================================================
@@ -2180,6 +3174,16 @@ def _run_workflow():
         context if isinstance(context, dict) else {},
         reproduction_source,
     )
+    report["reproduction_confirmed"] = reproduction_confirmed
+    if fix_review is not None:
+        report["fix_review"] = {
+            key: fix_review.get(key)
+            for key in ("decision", "feedback", "reviewed_by", "files", "diff_truncated", "checks")
+        }
+        report["fix_review"]["artifact_ref"] = os.path.relpath(
+            FIX_REVIEW_FILE, ACTIVE_RUN_ARTIFACT_DIR or BASE_DIR
+        )
+    save_json(WORKFLOW_REPORT_FILE, report)
 
     print(
         f"\nWorkflow Report:\n"
@@ -2298,7 +3302,57 @@ def run_with_optional_langfuse(workflow_runner, client_factory=None):
 
 
 def main():
-    return run_with_optional_langfuse(_run_workflow)
+    try:
+        return run_with_optional_langfuse(_run_workflow)
+    except WorkflowStopRequested as stop:
+        stopped_before = str(stop.args[0]) if stop.args else None
+        run_directory_value = os.environ.get(WORKFLOW_RUN_DIRECTORY_ENV)
+        if run_directory_value:
+            run_directory = os.path.realpath(run_directory_value)
+            runs_root = os.path.realpath(os.path.join(BASE_DIR, "workflow_runs"))
+            try:
+                inside_runs = os.path.commonpath((runs_root, run_directory)) == runs_root
+            except ValueError:
+                inside_runs = False
+            progress = ACTIVE_WORKFLOW_PROGRESS
+            run_paths_active = (
+                ACTIVE_RUN_ARTIFACT_DIR is not None
+                and os.path.realpath(ACTIVE_RUN_ARTIFACT_DIR) == run_directory
+            )
+            if inside_runs and progress is not None and run_paths_active:
+                # Reuse normal report generation so completed stages,
+                # retries and artifacts stay in the stopped report.
+                add_stage_result(
+                    progress["stage_results"],
+                    None,
+                    "Stopped Safely",
+                    "STOPPED",
+                    {"stopped_before_stage": stopped_before},
+                )
+                report = create_workflow_report(
+                    progress["stage_results"],
+                    progress["retry_history"],
+                    "STOPPED",
+                    progress["context"],
+                    progress["reproduction_source"],
+                )
+                report.update({
+                    "workflow_id": os.environ.get(WORKFLOW_ID_ENV),
+                    "stopped_before_stage": stopped_before,
+                    "stop_reason": "Stopped safely before the next stage; completed artifacts were preserved.",
+                })
+                save_json(WORKFLOW_REPORT_FILE, report)
+            elif inside_runs:
+                save_json(os.path.join(run_directory, "workflow_report.json"), {
+                    "workflow": "AI Agentic Software Debugging Workflow",
+                    "workflow_id": os.environ.get(WORKFLOW_ID_ENV),
+                    "target_repository": os.environ.get("LOCAL_REPOSITORY_PATH"),
+                    "final_status": "STOPPED",
+                    "deployment_status": "NOT_DEPLOYED",
+                    "deployment_readiness": "NOT_ASSESSED",
+                    "stop_reason": "Stopped safely before the next stage; completed artifacts were preserved.",
+                })
+        return 1
 
 
 # ============================================================

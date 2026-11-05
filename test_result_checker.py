@@ -5,6 +5,12 @@ import shlex
 import subprocess
 
 from workflow_artifacts import resolve_artifact_path
+from workflow_validation import (
+    counts_are_consistent,
+    parse_test_summary,
+    run_bounded,
+    project_process_environment,
+)
 
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -50,38 +56,7 @@ def failed_result(message, command=None):
 
 
 def parse_node_test_summary(output_text):
-    combined = output_text or ""
-
-    total = 0
-    passed = 0
-    failed = 0
-
-    patterns = [
-        (r"(?i)(?:ℹ\s*)?tests?\s+(\d+)", "tests"),
-        (r"(?i)(?:ℹ\s*)?pass(?:ed)?\s+(\d+)", "pass"),
-        (r"(?i)(?:ℹ\s*)?fail(?:ed|ures)?\s+(\d+)", "fail"),
-        (r"(?i)(\d+)\s+tests?", "tests"),
-        (r"(?i)(\d+)\s+pass(?:ed)?", "pass"),
-        (r"(?i)(\d+)\s+fail(?:ed|ures)?", "fail"),
-    ]
-
-    for pattern, key in patterns:
-        match = re.search(pattern, combined)
-
-        if match:
-            value = int(match.group(1))
-
-            if key == "tests":
-                total = value
-            elif key == "pass":
-                passed = value
-            elif key == "fail":
-                failed = value
-
-    if total == 0 and passed > 0 and failed > 0:
-        total = passed + failed
-
-    return total, passed, failed
+    return parse_test_summary(output_text)
 
 
 def main():
@@ -131,24 +106,49 @@ def main():
     # ---------------------------------------------------------
     generation_result = load_json(TEST_GENERATION_RESULT_PATH)
 
+    # Tests that need the app the workflow started (configured HTTP checks,
+    # or AI tests for an HTTP app) were already run with the app running;
+    # running them again here, without it, would only fail.
     if (
-        generation_result.get("configured_http_reproduction") is True
+        (
+            generation_result.get("configured_http_reproduction") is True
+            or generation_result.get("workflow_started_app") is True
+        )
         and isinstance(generation_result.get("return_code"), int)
     ):
         generated_status = generation_result.get("status")
         return_code = generation_result["return_code"]
-        passed = return_code == 0 and generated_status == "SUCCESS"
+        tests = generation_result.get("tests")
+        passed_count = generation_result.get("passed")
+        failed_count = generation_result.get("failed")
+        skipped_count = generation_result.get("skipped")
+        passed = (
+            return_code == 0
+            and generated_status == "SUCCESS"
+            and counts_are_consistent(
+                tests,
+                passed_count,
+                failed_count,
+                skipped_count,
+            )
+            and passed_count > 0
+            and failed_count == 0
+        )
 
         write_result({
             "status": "PASSED" if passed else "FAILED",
             "return_code": return_code,
-            "tests": generation_result.get("tests"),
-            "passed": generation_result.get("passed"),
-            "failed": generation_result.get("failed"),
+            "tests": tests,
+            "passed": passed_count,
+            "failed": failed_count,
+            "skipped": skipped_count,
             "test_file": generation_result.get("test_file"),
-            "command": " ".join(
-                str(part)
-                for part in generation_result.get("execution_command", [])
+            "command": (
+                lambda value: value if isinstance(value, str) else " ".join(str(part) for part in value)
+            )(
+                generation_result.get("execution_command")
+                or generation_result.get("test_command")
+                or []
             ),
             "stdout": generation_result.get("stdout", ""),
             "stderr": generation_result.get("stderr", ""),
@@ -232,11 +232,14 @@ def main():
             )
             raise SystemExit(0)
 
-        process = subprocess.run(
+        process = run_bounded(
             command_parts,
             cwd=working_directory,
+            env=project_process_environment(),
             capture_output=True,
             text=True,
+            encoding="utf-8",
+            errors="replace",
             check=False,
         )
     except OSError as error:
@@ -253,7 +256,7 @@ def main():
     stderr = process.stderr or ""
     combined = (stdout + "\n" + stderr).strip()
 
-    tests, passed, failed = parse_node_test_summary(combined)
+    tests, passed, failed, skipped = parse_test_summary(combined)
 
     status = "FAILED"
 
@@ -264,17 +267,8 @@ def main():
 
     if process.returncode == 0 and (
         generated_file_exists or generation_result.get("status") == "SUCCESS"
-    ):
+    ) and isinstance(tests, int) and tests > 0 and isinstance(passed, int) and passed > 0 and failed == 0 and passed + skipped == tests:
         status = "PASSED"
-
-    if (
-        status == "PASSED"
-        and isinstance(tests, int)
-        and isinstance(passed, int)
-        and isinstance(failed, int)
-        and (passed != tests or failed != 0)
-    ):
-        status = "FAILED"
 
     result = {
         "status": status,
@@ -282,6 +276,7 @@ def main():
         "tests": tests,
         "passed": passed,
         "failed": failed,
+        "skipped": skipped,
         "test_file": generated_test_file if isinstance(generated_test_file, str) else None,
         "command": " ".join(command_parts),
         "working_directory": working_directory,

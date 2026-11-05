@@ -3,6 +3,11 @@ import os
 import sys
 
 from workflow_artifacts import resolve_artifact_path
+from workflow_validation import (
+    build_result_has_success_evidence,
+    runtime_result_has_success_evidence,
+    test_result_has_success_evidence,
+)
 
 
 if hasattr(sys.stdout, "reconfigure"):
@@ -103,18 +108,10 @@ test_was_configured_or_generated = bool(test_command) or bool(
 )
 
 if test_was_configured_or_generated:
-    if test_result.get("return_code") != 0:
-        reasons.append("The configured test command returned a non-zero exit code.")
-
-    tests = test_result.get("tests")
-    passed = test_result.get("passed")
-    failed = test_result.get("failed")
-
-    if isinstance(tests, int) and isinstance(passed, int) and passed != tests:
-        reasons.append("Not all reported tests passed.")
-
-    if isinstance(failed, int) and failed != 0:
-        reasons.append("One or more test failures were reported.")
+    if not test_result_has_success_evidence(test_result):
+        reasons.append(
+            "Test result is missing a successful exit code or consistent passing test counts."
+        )
 
 # Run and verify builds detected on individual application components.
 if component_builds or build_command:
@@ -124,26 +121,24 @@ if component_builds or build_command:
         reasons.append(
             "A build command is configured, but build_result.json is missing or invalid."
         )
-    elif build_result.get("status") != "SKIPPED":
+    else:
         if build_result.get("return_code") != 0:
             reasons.append("The build command returned a non-zero exit code.")
 
-        if build_result.get("status") not in (None, "PASSED", "PASS", "SUCCESS"):
+        if build_result.get("status") not in ("PASSED", "PASS", "SUCCESS"):
             reasons.append("The build result does not indicate success.")
+
+        expected_builds = len(component_builds) if component_builds else 1
+        if not build_result_has_success_evidence(build_result, expected_builds):
+            reasons.append("Build result is missing successful component evidence.")
 
 validation_result = load_json(VALIDATION_RESULT_PATH)
 
 if validation_result is not None:
     if not isinstance(validation_result, dict):
         reasons.append("validation_result.json is invalid.")
-    elif validation_result.get("status") not in (
-        "PASSED",
-        "PASS",
-        "SUCCESS",
-        "FIXED",
-        "SKIPPED",
-    ):
-        reasons.append("Runtime validation did not confirm the fix.")
+    elif not runtime_result_has_success_evidence(validation_result):
+        reasons.append("Runtime validation is missing structured success evidence.")
 elif validation_method and "http" in str(validation_method).lower():
     reasons.append("HTTP runtime validation result is missing.")
 
@@ -151,6 +146,7 @@ status = "PASS" if not reasons else "FAIL"
 
 report = {
     "status": status,
+    "return_code": 0 if status == "PASS" else 1,
     "reason": reasons or [
         "Verification succeeded: the configured test execution completed successfully."
     ],

@@ -24,6 +24,32 @@ const {
   PostToConnectionCommand,
 } = require("@aws-sdk/client-apigatewaymanagementapi");
 
+// Reads the MessagesTable key attributes from serverless.yml, so this test
+// checks the table that would actually be deployed.
+const readConfiguredKeyAttributes = () => {
+  const fs = require("fs");
+  const path = require("path");
+  const lines = fs
+    .readFileSync(path.join(__dirname, "..", "serverless.yml"), "utf8")
+    .split(/\r?\n/);
+  const start = lines.findIndex((line) => line.trim() === "KeySchema:");
+  if (start === -1) {
+    throw new Error("serverless.yml does not define a DynamoDB KeySchema.");
+  }
+  const indent = lines[start].search(/\S/);
+  const attributes = [];
+  for (const line of lines.slice(start + 1)) {
+    if (line.trim() === "") continue;
+    if (line.search(/\S/) <= indent) break;
+    const match = line.match(/AttributeName:\s*["']?([\w-]+)["']?/);
+    if (match) attributes.push(match[1]);
+  }
+  if (attributes.length === 0) {
+    throw new Error("serverless.yml KeySchema has no AttributeName entries.");
+  }
+  return attributes;
+};
+
 const makeMessageEvent = (payload) => ({
   body: JSON.stringify(payload),
   requestContext: {
@@ -106,6 +132,46 @@ describe("WebSocket Lambda handlers", () => {
       requestId: "request-1",
       status: "saved",
     });
+  });
+
+  test("retains two sequential messages from the same connection", async () => {
+    const rowsByConfiguredKey = new Map();
+    const keyAttributes = process.env.DEMO_DYNAMODB_KEY_ATTRIBUTES
+      ? JSON.parse(process.env.DEMO_DYNAMODB_KEY_ATTRIBUTES)
+      : readConfiguredKeyAttributes();
+    // Behave like DynamoDB: items are stored by the table's key, so items
+    // sharing the same key replace each other, and a missing key is rejected.
+    mockDynamoSend.mockImplementation(async (command) => {
+      const item = command.input.Item;
+      const missing = keyAttributes.filter((name) => !item[name] || !item[name].S);
+      if (missing.length > 0) {
+        throw new Error(`ValidationException: missing key attribute(s) ${missing.join(", ")}`);
+      }
+      const configuredKey = keyAttributes
+        .map((keyAttribute) => item[keyAttribute].S)
+        .join("\0");
+      rowsByConfiguredKey.set(configuredKey, { ...item });
+    });
+
+    await message(
+      makeMessageEvent({
+        action: "message",
+        requestId: "request-first",
+        message: "first message",
+      })
+    );
+    await message(
+      makeMessageEvent({
+        action: "message",
+        requestId: "request-second",
+        message: "second message",
+      })
+    );
+
+    expect(Array.from(rowsByConfiguredKey.values()).map((item) => item.message.S)).toEqual([
+      "first message",
+      "second message",
+    ]);
   });
 
   test.each([

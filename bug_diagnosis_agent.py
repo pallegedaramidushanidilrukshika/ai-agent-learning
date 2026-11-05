@@ -9,7 +9,11 @@ from langchain_groq import ChatGroq
 from groq import APIStatusError, Groq
 
 from workflow_artifacts import resolve_artifact_path
+from workflow_validation import diagnosis_validation_errors
 
+# The Groq free tier allows 8,000 tokens per minute. The SDK waits for the
+# retry-after time the API returns, so a few retries let the minute reset.
+GROQ_MAX_RETRIES = 5
 
 # =========================================================
 # Configuration
@@ -216,7 +220,7 @@ if hasattr(sys.stdout, "reconfigure"):
 # Initialize Groq
 # =========================================================
 
-client = Groq(api_key=GROQ_API_KEY)
+client = Groq(api_key=GROQ_API_KEY, max_retries=GROQ_MAX_RETRIES)
 
 
 # =========================================================
@@ -226,9 +230,11 @@ client = Groq(api_key=GROQ_API_KEY)
 argument_parser = argparse.ArgumentParser()
 argument_parser.add_argument("bug_report", nargs="?")
 argument_parser.add_argument("--manual-reproduction")
+argument_parser.add_argument("--reproduction-test")
 arguments = argument_parser.parse_args(sys.argv[1:])
 
 manual_reproduction_file = arguments.manual_reproduction
+reproduction_test_file = arguments.reproduction_test
 bug_report_file = arguments.bug_report
 if not bug_report_file:
     bug_report_file = BUG_REPORT_PATH
@@ -280,9 +286,25 @@ try:
         if manual_error:
             raise DiagnosisInputError(manual_error)
 
+    reproduction_test = None
+    if reproduction_test_file:
+        reproduction_test = load_json_object(
+            reproduction_test_file,
+            "Confirmed reproduction test",
+        )
+        if (
+            reproduction_test.get("status") != "CONFIRMED"
+            or not isinstance(reproduction_test.get("content"), str)
+            or not reproduction_test["content"].strip()
+            or not isinstance(reproduction_test.get("test_file"), str)
+        ):
+            raise DiagnosisInputError(
+                "The reproduction test must be a confirmed test with its file path and content."
+            )
+
     reproduction_result = load_reproduction_result(
         REPRODUCTION_RESULT_FILE,
-        manual_mode=manual_reproduction is not None,
+        manual_mode=manual_reproduction is not None or reproduction_test is not None,
     )
 except DiagnosisInputError as error:
     argument_parser.error(str(error))
@@ -424,6 +446,116 @@ def compact_json_value(value, max_chars, prioritize_diagnostics=False, depth=0):
     return compact_evidence_text(value, max_chars, prioritize_diagnostics)
 
 
+ENTRY_FILE_PATTERN = re.compile(r"[\w./\\-]+\.(?:js|mjs|cjs|ts|py)$", re.IGNORECASE)
+
+
+def _npm_script(repository_path, base, command):
+    """The script text behind "npm start" / "npm run <name>", if any."""
+    parts = command.split()
+    if parts[:2] == ["npm", "start"]:
+        name = "start"
+    elif parts[:2] == ["npm", "run"] and len(parts) > 2:
+        name = parts[2]
+    else:
+        return None
+    try:
+        with open(os.path.join(repository_path, base, "package.json"), "r", encoding="utf-8") as handle:
+            scripts = json.load(handle).get("scripts") or {}
+    except (OSError, ValueError, AttributeError):
+        return None
+    script = scripts.get(name) if isinstance(scripts, dict) else None
+    return script if isinstance(script, str) else None
+
+
+def application_entry_files(context):
+    """Source files the app is started from: "node index.js" -> index.js, and
+    "npm start" -> package.json "node --env-file=config.env server" ->
+    <backend path>/server.js."""
+    repository_path = str(context.get("repository_path") or "")
+    commands = []
+    strategy = context.get("execution_strategy")
+    if isinstance(strategy, dict):
+        commands += [
+            (strategy.get("start_command"), "."),
+            (strategy.get("backend_start_command"), strategy.get("backend_path") or "."),
+        ]
+    architecture = context.get("architecture")
+    for component in architecture.get("components", []) if isinstance(architecture, dict) else []:
+        if isinstance(component, dict):
+            commands.append((component.get("start_command"), component.get("path") or "."))
+    entries = set()
+    for command, base in commands:
+        if not isinstance(command, str) or not isinstance(base, str):
+            continue
+        script = _npm_script(repository_path, base, command) if repository_path else None
+        tokens = [token.strip("'\"") for token in (script or command).split()]
+        after_node = False
+        for token in tokens:
+            name = None
+            if ENTRY_FILE_PATTERN.fullmatch(token):
+                name = token
+            elif after_node and not token.startswith("-") and re.fullmatch(r"[\w./-]+", token):
+                name = token + ".js"
+            if os.path.basename(token).lower() in ("node", "node.exe"):
+                after_node = True
+            if name:
+                path = os.path.normpath(os.path.join(base, name)).replace("\\", "/")
+                entries.add(path.lstrip("./").lower())
+                after_node = False
+    return entries
+
+
+SOURCE_EXTENSIONS = (".js", ".mjs", ".cjs", ".ts", ".jsx", ".tsx", ".py", ".java", ".cs")
+# What kind of operation the bug is about, and the words code uses for it.
+FOCUS_TERM_GROUPS = (
+    (("save", "create", "add", "submit", "new", "insert", "post"), ("post", "insert", "create", "add", "push", "save")),
+    (("edit", "update", "change", "modify"), ("patch", "put", "update", "set")),
+    (("delete", "remove", "clear"), ("delete", "remove", "splice", "destroy")),
+)
+
+
+def bug_focus_terms(signals):
+    terms = []
+    for triggers, code_words in FOCUS_TERM_GROUPS:
+        if any(re.search(rf"\b{word}", signals) for word in triggers):
+            terms.extend(code_words)
+    return tuple(dict.fromkeys(terms))
+
+
+def focused_excerpt(text, max_chars, focus_terms):
+    """Clip long source around the lines that match the bug's operation
+    (for a "save" bug: post/insert/create), instead of keeping only the
+    start and the end, which loses handlers in the middle of a file."""
+    if len(text) <= max_chars or not focus_terms:
+        return compact_evidence_text(text, max_chars)
+    lines = text.splitlines()
+    pattern = re.compile(r"\b(?:" + "|".join(map(re.escape, focus_terms)) + r")\b", re.IGNORECASE)
+    scores = [len(pattern.findall(line)) for line in lines]
+    if not any(scores):
+        return compact_evidence_text(text, max_chars)
+    best = max(range(len(lines)), key=lambda index: (scores[index], -index))
+    start = end = best
+    size = len(lines[best]) + 1
+    budget = max_chars - 60
+    # Grow mostly downward (the handler body follows its signature), about
+    # three lines down per line up; use the other side when one is blocked.
+    while True:
+        can_grow_down = end + 1 < len(lines) and size + len(lines[end + 1]) + 1 <= budget
+        can_grow_up = start > 0 and size + len(lines[start - 1]) + 1 <= budget
+        if can_grow_down and (not can_grow_up or end - best < 3 * (best - start) + 3):
+            end += 1
+            size += len(lines[end]) + 1
+        elif can_grow_up:
+            start -= 1
+            size += len(lines[start]) + 1
+        else:
+            break
+    excerpt = "\n".join(lines[start:end + 1])
+    prefix = f"[... lines 1-{start} clipped ...]\n" if start > 0 else ""
+    suffix = f"\n[... lines {end + 2}-{len(lines)} clipped ...]" if end + 1 < len(lines) else ""
+    return prefix + excerpt + suffix
+
+
 def compact_repository_context(context, bug, reproduction=None, max_chars=3600):
     """Keep architecture and the most relevant source excerpts only."""
     context = context if isinstance(context, dict) else {}
@@ -444,6 +576,8 @@ def compact_repository_context(context, bug, reproduction=None, max_chars=3600):
     file_contents = context.get("file_contents", {})
     if not isinstance(file_contents, dict):
         file_contents = {}
+    entry_files = application_entry_files(context)
+    focus_terms = bug_focus_terms(signals)
 
     scored_files = []
     for path, content in file_contents.items():
@@ -452,6 +586,10 @@ def compact_repository_context(context, bug, reproduction=None, max_chars=3600):
         score = 0
         if normalized_path.lower() in signals:
             score += 20
+        # The file the app is started with (for example "node index.js")
+        # usually holds the routes, whatever its name.
+        if normalized_path.lower() in entry_files:
+            score += 15
         score += sum(
             3
             for term in (
@@ -461,6 +599,9 @@ def compact_repository_context(context, bug, reproduction=None, max_chars=3600):
             if term in basename or term in normalized_path.lower()
         )
         score += min(8, signals.count(basename)) if basename else 0
+        # Code says more than manifests: among relevant files, prefer source.
+        if score > 0 and basename.endswith(SOURCE_EXTENSIONS):
+            score += 2
         scored_files.append((score, normalized_path, content))
 
     scored_files.sort(key=lambda item: (-item[0], item[1]))
@@ -477,25 +618,31 @@ def compact_repository_context(context, bug, reproduction=None, max_chars=3600):
         ][:5]
 
     source_excerpts = {}
-    source_budget = 2200
+    # Excerpts get their own share of the context budget; the generic
+    # compaction below would cut every file to a few hundred characters.
+    source_budget = min(2200, int(max_chars * 0.65))
     for _score, path, content in relevant_files[:5]:
         if not isinstance(content, str):
             continue
         available = source_budget - sum(len(value) for value in source_excerpts.values())
         if available <= 0:
             break
-        excerpt_limit = min(850, available)
-        source_excerpts[path] = compact_evidence_text(content, excerpt_limit)
+        # The best-ranked file gets more room, so a short entry file is
+        # shown whole instead of losing its middle (where routes often are).
+        excerpt_limit = min(1600 if not source_excerpts else 850, available)
+        source_excerpts[path] = focused_excerpt(content, excerpt_limit, focus_terms)
 
     compact["important_files"] = [
         path for _score, path, _content in relevant_files[:12]
     ]
-    compact["file_contents"] = source_excerpts
     compact["context_note"] = (
         "Repository inventory and source excerpts are ranked and bounded; "
         "reproduction output is the primary runtime evidence."
     )
-    return compact_json_value(compact, max_chars)
+    excerpt_size = len(json.dumps(source_excerpts, ensure_ascii=False))
+    compact = compact_json_value(compact, max(256, max_chars - excerpt_size - 20)) or {}
+    compact["file_contents"] = source_excerpts
+    return compact
 
 
 def compact_bug_report(bug, max_chars=700):
@@ -525,8 +672,33 @@ def build_diagnosis_prompt(
     reproduction,
     repository_context,
     manual_reproduction=None,
+    reproduction_test=None,
 ):
-    if manual_reproduction is None:
+    if reproduction_test is not None and manual_reproduction is None:
+        before_fix = reproduction_test.get("before_fix") or {}
+        run = before_fix.get("run") if isinstance(before_fix.get("run"), dict) else {}
+        reproduction_context = {
+            "source": "human-confirmed-reproduction-test",
+            "automatically_reproduced": False,
+            "automatic_reproduction_result": reproduction,
+            "reproduction_test": {
+                "test_file": reproduction_test.get("test_file"),
+                "framework": reproduction_test.get("framework"),
+                "result_on_current_code": before_fix.get("classification"),
+                "content": str(reproduction_test.get("content", ""))[:2500],
+                "failing_output": str(run.get("output_tail", ""))[-1200:],
+            },
+        }
+        source_guidance = (
+            "A user confirmed that this automated reproduction test shows the "
+            "bug: it fails on the current code. Treat the test and its failure "
+            "output as the primary evidence, explain why the current code makes "
+            "it fail, and propose a fix that makes this exact test pass without "
+            "changing the test. Use the bounded repository excerpts as "
+            "supporting evidence."
+        )
+        reproduction_heading = "REPRODUCTION CONTEXT (USER-CONFIRMED TEST)"
+    elif manual_reproduction is None:
         reproduction_context = reproduction
         source_guidance = (
             "Use the confirmed automatic reproduction as primary evidence and "
@@ -550,7 +722,7 @@ def build_diagnosis_prompt(
         )
         reproduction_heading = "REPRODUCTION CONTEXT (MANUAL USER REPORT)"
 
-    instruction = """You are an AI software bug diagnosis agent. Use the confirmed reproduction as primary evidence and the bounded repository excerpts as supporting evidence. Respect the detected language/framework; do not assume Python. Diagnose all reported symptoms, trace relevant data flow, identify exact affected files, explain the root cause, propose a minimal safe fix, and give a verification plan. Do not modify source or tests. Do not guess when evidence is insufficient. Return only a complete JSON object, no markdown or surrounding prose, using exactly this schema:
+    instruction = """You are an AI software bug diagnosis agent. Use the confirmed reproduction as primary evidence and the bounded repository excerpts as supporting evidence. Respect the detected language/framework; do not assume Python. Diagnose all reported symptoms, trace relevant data flow, identify exact affected files, explain the root cause, propose a minimal safe fix, and give a verification plan. If the root cause depends on configuration, schema or infrastructure definitions (for example database key schemas, migrations, serverless or other infrastructure-as-code templates), list those files in affected_files together with the application code, and describe the change to both in proposed_fix. Do not modify source or tests. Do not guess when evidence is insufficient. Return only a complete JSON object, no markdown or surrounding prose, using exactly this schema:
 {"bug_title":"string","project_type":"string","failure_analysis":"string","root_cause":"string","affected_files":["string"],"evidence":["string"],"proposed_fix":"string","verification_plan":["string"]}
 
 BUG REPORT:
@@ -612,6 +784,7 @@ prompt = build_diagnosis_prompt(
     reproduction_result,
     repository_context,
     manual_reproduction,
+    reproduction_test,
 )
 
 
@@ -636,118 +809,96 @@ model_call_result = {
 
 write_model_call_result(model_call_result)
 
-try:
-    response = client.chat.completions.create(
-        model="openai/gpt-oss-20b",
-        messages=[
-            {
-                "role": "user",
-                "content": prompt
-            }
-        ],
-        temperature=0,
-        max_completion_tokens=DIAGNOSIS_MAX_COMPLETION_TOKENS,
-        reasoning_effort="low",
-        include_reasoning=False
-    )
-except Exception as error:
-    write_model_call_result(model_call_result, error, GROQ_API_KEY)
-    print("Groq diagnosis request failed; sanitized status metadata was saved.")
-    sys.exit(1)
-else:
-    model_call_result.update({
-        "succeeded": True,
-        "outcome": "succeeded",
-    })
-    write_model_call_result(model_call_result)
+# The model sometimes returns empty, malformed or incomplete JSON. Ask once
+# more, telling it why the previous answer was rejected, before failing.
+DIAGNOSIS_MODEL_ATTEMPTS = 2
+diagnosis_messages = [{"role": "user", "content": prompt}]
+diagnosis = None
 
-message = response.choices[0].message
+for model_attempt in range(1, DIAGNOSIS_MODEL_ATTEMPTS + 1):
+    try:
+        response = client.chat.completions.create(
+            model="openai/gpt-oss-20b",
+            messages=diagnosis_messages,
+            temperature=0,
+            max_completion_tokens=DIAGNOSIS_MAX_COMPLETION_TOKENS,
+            reasoning_effort="low",
+            include_reasoning=False
+        )
+    except Exception as error:
+        write_model_call_result(model_call_result, error, GROQ_API_KEY)
+        print("Groq diagnosis request failed; sanitized status metadata was saved.")
+        sys.exit(1)
+    else:
+        model_call_result.update({
+            "succeeded": True,
+            "outcome": "succeeded",
+            "response_attempts": model_attempt,
+        })
+        write_model_call_result(model_call_result)
 
-print("\n===== GROQ DEBUG =====")
-print("Finish reason:", response.choices[0].finish_reason)
-print("Content:", repr(message.content).encode("ascii", "backslashreplace").decode("ascii"))
-print("Reasoning:", repr(getattr(message, "reasoning", None)).encode("ascii", "backslashreplace").decode("ascii"))
-print("======================")
+    message = response.choices[0].message
 
-result = message.content or ""
-result = result.strip()
+    print("\n===== GROQ DEBUG =====")
+    print("Finish reason:", response.choices[0].finish_reason)
+    print("Content:", repr(message.content).encode("ascii", "backslashreplace").decode("ascii"))
+    print("Reasoning:", repr(getattr(message, "reasoning", None)).encode("ascii", "backslashreplace").decode("ascii"))
+    print("======================")
 
-print("\nRaw Groq response:")
-print(json.dumps(result, ensure_ascii=False, indent=2))
+    result = message.content or ""
+    result = result.strip()
 
-# =========================================================
-# Clean AI response
-# =========================================================
+    print("\nRaw Groq response:")
+    print(json.dumps(result, ensure_ascii=False, indent=2))
 
-if result.startswith("```json"):
-    result = result[7:]
+    # Clean AI response
+    if result.startswith("```json"):
+        result = result[7:]
+    elif result.startswith("```"):
+        result = result[3:]
+    if result.endswith("```"):
+        result = result[:-3]
+    result = result.strip()
 
-elif result.startswith("```"):
-    result = result[3:]
+    rejection = None
+    if not result:
+        print("\nERROR: Groq returned an empty response.")
+        rejection = "The response was empty."
+    else:
+        try:
+            candidate = json.loads(result)
+        except json.JSONDecodeError:
+            print("\nERROR: Groq returned invalid JSON.")
+            print("\nRaw response:\n")
+            print(result)
+            rejection = "The response was not valid JSON."
+        else:
+            diagnosis_errors = diagnosis_validation_errors(candidate, manual_reproduction)
+            if diagnosis_errors:
+                print("\nERROR: Groq returned an incomplete or non-actionable diagnosis:")
+                for diagnosis_error in diagnosis_errors:
+                    print(f"- {diagnosis_error}")
+                rejection = " ".join(diagnosis_errors)
+            else:
+                diagnosis = candidate
+                break
 
-if result.endswith("```"):
-    result = result[:-3]
+    if model_attempt < DIAGNOSIS_MODEL_ATTEMPTS:
+        print(f"\nRetrying the diagnosis request once (attempt {model_attempt + 1}/{DIAGNOSIS_MODEL_ATTEMPTS}).")
+        diagnosis_messages = [{
+            "role": "user",
+            "content": (
+                prompt
+                + "\n\nYOUR PREVIOUS RESPONSE WAS REJECTED: "
+                + rejection[:600]
+                + "\nReturn only one complete JSON object that follows the schema, "
+                "with every field non-empty and actionable."
+            ),
+        }]
 
-result = result.strip()
-
-
-# =========================================================
-# Handle empty response
-# =========================================================
-
-if not result:
-
-    print("\nERROR: Groq returned an empty response.")
+if diagnosis is None:
     print("The diagnosis was not generated.")
-
     sys.exit(1)
-
-
-# =========================================================
-# Parse JSON
-# =========================================================
-
-try:
-
-    diagnosis = json.loads(result)
-
-except json.JSONDecodeError:
-
-    print("\nERROR: Groq returned invalid JSON.")
-
-    print("\nRaw response:\n")
-    print(result)
-
-    sys.exit(1)
-
-
-# =========================================================
-# Validate required fields
-# =========================================================
-
-required_fields = [
-    "bug_title",
-    "project_type",
-    "failure_analysis",
-    "root_cause",
-    "affected_files",
-    "evidence",
-    "proposed_fix",
-    "verification_plan"
-]
-
-missing_fields = [
-    field
-    for field in required_fields
-    if field not in diagnosis
-]
-
-if missing_fields:
-
-    raise ValueError(
-        "Diagnosis is missing required fields: "
-        + ", ".join(missing_fields)
-    )
 
 
 # =========================================================

@@ -366,10 +366,10 @@ def apply_message_retention_fix(demo_repository, _attempt):
     ):
         return {
             "status": "SUCCESS",
-            "modified_files": [
-                "backend/serverless.yml",
-                "backend/src/websocket.js",
-            ],
+            "modified_files": [],
+            "changed": False,
+            "reread_verified": True,
+            "already_present": True,
             "change": "The targeted per-message key fix is already present.",
         }
 
@@ -377,26 +377,45 @@ def apply_message_retention_fix(demo_repository, _attempt):
         return {
             "status": "FAILED",
             "modified_files": [],
+            "changed": False,
+            "reread_verified": False,
             "error": "Disposable project no longer matches the diagnosed overwrite pattern.",
         }
 
+    fixed_serverless_text = serverless_text.replace(old_schema, new_schema, 1)
+    fixed_handler_text = handler_text.replace(old_item, new_item, 1)
     serverless_path.write_text(
-        serverless_text.replace(old_schema, new_schema, 1),
+        fixed_serverless_text,
         encoding="utf-8",
     )
     handler_path.write_text(
-        handler_text.replace(old_item, new_item, 1),
+        fixed_handler_text,
         encoding="utf-8",
     )
+    reread_serverless_text = serverless_path.read_text(encoding="utf-8")
+    reread_handler_text = handler_path.read_text(encoding="utf-8")
+    modified_files = [
+        relative_path
+        for relative_path, before, after in (
+            ("backend/serverless.yml", serverless_text, reread_serverless_text),
+            ("backend/src/websocket.js", handler_text, reread_handler_text),
+        )
+        if before != after
+    ]
+    reread_verified = (
+        reread_serverless_text == fixed_serverless_text
+        and reread_handler_text == fixed_handler_text
+    )
     return {
-        "status": "SUCCESS",
-        "modified_files": [
-            "backend/serverless.yml",
-            "backend/src/websocket.js",
-        ],
+        "status": "SUCCESS" if reread_verified else "FAILED",
+        "modified_files": modified_files,
+        "changed": bool(modified_files),
+        "reread_verified": reread_verified,
         "change": (
             "Added messageId as the DynamoDB sort key and wrote requestId as "
             "the per-message key."
+            if reread_verified
+            else "Written content did not match the expected fix on reread."
         ),
     }
 
@@ -730,11 +749,12 @@ def run_level3_websocket_demo(
     semantic_fix_present = bool(
         attempts and attempts[-1].get("semantic_fix_present")
     )
-    applied_files = (
-        final_fix_result.get("modified_files", [])
-        if semantic_fix_present
-        else []
-    )
+    applied_files = sorted({
+        file_name
+        for attempt_result in attempts
+        for file_name in attempt_result.get("fix_result", {}).get("modified_files", [])
+        if isinstance(file_name, str)
+    })
     code_fix_result = {
         **final_fix_result,
         "fixer_status": final_fix_result.get("status"),
@@ -746,6 +766,11 @@ def run_level3_websocket_demo(
             else "FAILED"
         ),
         "modified_files": applied_files,
+        "changed": bool(applied_files),
+        "reread_verified": bool(attempts) and all(
+            attempt.get("fix_result", {}).get("reread_verified") is True
+            for attempt in attempts
+        ),
         "semantic_fix_present": semantic_fix_present,
         "verified": verified,
         "attempts": attempts,
@@ -777,7 +802,7 @@ def run_level3_websocket_demo(
     verification_reason = (
         "Groq diagnosis did not succeed and validate; no fixer was run."
         if diagnosis_mode == "groq_ai" and not diagnosis_success
-        else "Initial failing reproduction was observed, the targeted disposable fix changed both key schema and handler item, and the same regression plus backend suite passed."
+        else "Initial failing reproduction was observed, the targeted disposable fix was reread, and the same regression plus backend suite passed."
         if final_status == "PASS"
         else "The initial failure, diagnosis, targeted fix, and post-fix regression were not all verified."
     )
@@ -889,7 +914,7 @@ def run_level3_websocket_demo(
             },
             {
                 "stage": 6,
-                "name": "Frontend build/lint and backend preflight",
+                "name": "Frontend build/lint preflight",
                 "status": (
                     "SUCCESS"
                     if preflight_validation is not None

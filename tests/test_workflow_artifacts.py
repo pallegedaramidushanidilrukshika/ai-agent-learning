@@ -13,8 +13,15 @@ from unittest.mock import Mock
 import pytest
 
 import local_websocket_demo
+import test_generation_agent
+import test_result_checker
 import workflow_orchestrator
 from workflow_artifacts import ARTIFACT_DIR_ENV, resolve_artifact_path
+from workflow_validation import (
+    diagnosis_validation_errors,
+    parse_test_summary,
+    project_process_environment,
+)
 
 
 def load_repository_agent_module(monkeypatch):
@@ -266,6 +273,37 @@ def test_groq_diagnosis_prompt_bounds_oversized_context_and_preserves_evidence(
     assert "affected handler excerpt" in prompt
     assert "generated/irrelevant_3999.js" not in prompt
     assert "ignore-me-content" not in prompt
+
+
+def test_groq_diagnosis_prompt_shows_the_whole_entry_file(tmp_path, monkeypatch):
+    # Level 1 shape: the route lives in the middle of index.js, a file whose
+    # name matches no handler/route keyword. It must reach the model whole.
+    index_js = (
+        "var express = require('express');\n" + "// setup line\n" * 50
+        + 'app.post("/addtask", function(req, res) {\n'
+        + "    task.push(req.body.newtask);\n});\n"
+        + "// tail line\n" * 30
+    )
+    repository_context = {
+        "repository_path": "C:/demo/todo",
+        "execution_strategy": {"technology": "Node.js", "start_command": "node index.js"},
+        "file_contents": {
+            "index.js": index_js,
+            "package.json": '{"name": "todo", "dependencies": {"express": "^4"}}',
+            "README.md": "readme " * 300,
+        },
+    }
+    bug_report = {"bug_title": "Whitespace-only input is added to the to-do list"}
+    reproduction_result = {"status": "REPRODUCED", "evidence": ["3 items instead of 2"]}
+
+    prompt, _call_arguments, _run_dir, _stderr = capture_groq_diagnosis_prompt(
+        monkeypatch, tmp_path, repository_context, reproduction_result, bug_report,
+    )
+
+    assert len(prompt) <= 8500
+    assert len(index_js) < 1600
+    assert 'app.post(\\"/addtask\\"' in prompt
+    assert "task.push(req.body.newtask)" in prompt
 
 
 def test_groq_diagnosis_prompt_labels_manual_evidence_as_unconfirmed(
@@ -592,10 +630,11 @@ def load_code_fix_config(monkeypatch, diagnosis_path=None):
         spec.loader.exec_module(module)
 
     dotenv_module.load_dotenv.assert_called_once_with()
-    groq_client.assert_called_once_with(api_key="offline-test-key")
+    groq_client.assert_called_once_with(api_key="offline-test-key", max_retries=5)
     chat_groq.assert_called_once_with(
         model="openai/gpt-oss-20b",
         temperature=0,
+        max_retries=5,
     )
     create_agent.assert_called_once()
     return module, create_agent
@@ -1227,7 +1266,7 @@ def test_bug_diagnosis_agent_cli_bug_report_overrides_environment(
 
     assert error.value.args == (cli_path,)
     assert loaded_report_paths == [cli_path]
-    groq_client.assert_called_once_with(api_key="offline-test-key")
+    groq_client.assert_called_once_with(api_key="offline-test-key", max_retries=5)
 
 
 def test_code_fix_agent_uses_configured_workflow_artifact_paths(
@@ -1467,6 +1506,575 @@ def test_orchestrator_uses_current_run_diagnosis_and_fix_result_paths(
     assert result["success"] is True
     assert fix_result["status"] == "SUCCESS"
     assert root_fix_result.read_bytes() == original_root_result
+
+
+def test_diagnosis_validation_rejects_insufficient_evidence_and_empty_fields():
+    diagnosis = {
+        "bug_title": "Unverified bug",
+        "project_type": "Node.js",
+        "failure_analysis": "No runtime evidence was provided.",
+        "root_cause": "Insufficient evidence to determine a root cause.",
+        "affected_files": [],
+        "evidence": ["The report says not verified."],
+        "proposed_fix": "None at this time; further investigation is required.",
+        "verification_plan": ["Run the reproduction steps."],
+    }
+
+    errors = diagnosis_validation_errors(diagnosis)
+
+    assert any("root cause" in error for error in errors)
+    assert any("affected_files" in error for error in errors)
+    assert any("actionable proposed fix" in error for error in errors)
+
+
+@pytest.mark.parametrize(
+    ("field", "value"),
+    [
+        ("bug_title", "unknown"),
+        ("project_type", "TBD"),
+        ("root_cause", "to be determined"),
+        ("proposed_fix", "N/A"),
+        ("affected_files", ["unknown"]),
+        ("evidence", ["TBD"]),
+        ("verification_plan", ["todo"]),
+    ],
+)
+def test_diagnosis_validation_rejects_placeholder_values(field, value):
+    diagnosis = {
+        "bug_title": "WebSocket message overwrite",
+        "project_type": "Node.js Serverless",
+        "failure_analysis": "The second message replaces the first.",
+        "root_cause": "The table uses connectionId as its only key.",
+        "affected_files": ["backend/src/websocket.js"],
+        "evidence": ["The schema only contains connectionId."],
+        "proposed_fix": "Add a unique messageId sort key to each message.",
+        "verification_plan": ["Send two messages and confirm two records."],
+    }
+    diagnosis[field] = value
+
+    assert diagnosis_validation_errors(diagnosis)
+
+
+def test_diagnosis_validation_accepts_complete_actionable_evidence():
+    diagnosis = {
+        "bug_title": "WebSocket message overwrite",
+        "project_type": "Node.js Serverless",
+        "failure_analysis": "The second message replaces the first.",
+        "root_cause": "The table key contains only connectionId.",
+        "affected_files": ["backend/serverless.yml", "backend/src/websocket.js"],
+        "evidence": ["The table schema uses connectionId as its sole key."],
+        "proposed_fix": "Add messageId as a DynamoDB sort key and write a unique value.",
+        "verification_plan": ["Send two messages and assert two stored records."],
+    }
+
+    assert diagnosis_validation_errors(diagnosis) == []
+
+
+@pytest.mark.parametrize(
+    ("field", "value"),
+    [
+        ("bug_title", "unknown"),
+        ("project_type", "TBD"),
+        ("root_cause", "to be determined"),
+        ("proposed_fix", "N/A"),
+        ("affected_files", ["unknown"]),
+        ("evidence", ["TBD"]),
+        ("verification_plan", ["todo"]),
+    ],
+)
+def test_diagnosis_validation_rejects_placeholder_values(field, value):
+    diagnosis = {
+        "bug_title": "WebSocket message overwrite",
+        "project_type": "Node.js Serverless",
+        "failure_analysis": "The second message replaces the first.",
+        "root_cause": "Only connectionId is used as a key.",
+        "affected_files": ["backend/src/websocket.js"],
+        "evidence": ["The handler writes connectionId."],
+        "proposed_fix": "Add a unique messageId key for each message.",
+        "verification_plan": ["Send two messages and inspect stored records."],
+    }
+    diagnosis[field] = value
+
+    assert diagnosis_validation_errors(diagnosis)
+
+
+def test_diagnosis_validation_rejects_fix_that_removes_required_prior_records():
+    diagnosis = {
+        "bug_title": "WebSocket message accumulation",
+        "project_type": "Node.js Serverless",
+        "failure_analysis": "Messages should be stored independently.",
+        "root_cause": "The message handler uses a single DynamoDB key.",
+        "affected_files": ["backend/src/websocket.js"],
+        "evidence": ["The table key is connectionId only."],
+        "proposed_fix": "Delete the existing message before writing the new one.",
+        "verification_plan": ["Send two messages and verify both records remain."],
+    }
+    manual = {
+        "expected_behavior": (
+            "Each message should be stored as a separate record and earlier "
+            "messages should remain available."
+        ),
+    }
+
+    errors = diagnosis_validation_errors(diagnosis, manual)
+
+    assert any("conflicts with the manual expected behavior" in error for error in errors)
+
+
+def test_diagnosis_validation_accepts_fix_consistent_with_retained_records():
+    diagnosis = {
+        "bug_title": "WebSocket message overwrite",
+        "project_type": "Node.js Serverless",
+        "failure_analysis": "The table lacks a per-message sort key.",
+        "root_cause": "Only connectionId is configured as a key.",
+        "affected_files": ["backend/serverless.yml", "backend/src/websocket.js"],
+        "evidence": ["The schema defines only connectionId."],
+        "proposed_fix": "Add a unique messageId sort key and include it in each item.",
+        "verification_plan": ["Send two messages and verify both records remain."],
+    }
+    manual = {
+        "expected_behavior": "Keep separate records for each message sent.",
+    }
+
+    assert diagnosis_validation_errors(diagnosis, manual) == []
+
+
+def test_local_execution_preflight_blocks_missing_jest_and_build_dependencies(tmp_path):
+    repository = tmp_path / "target"
+    (repository / "backend").mkdir(parents=True)
+    (repository / "frontend").mkdir()
+    (repository / "backend" / "package.json").write_text("{}", encoding="utf-8")
+    (repository / "frontend" / "package.json").write_text("{}", encoding="utf-8")
+    context = {
+        "repository_path": os.fspath(repository),
+        "execution_strategy": {
+            "technology": "React/Vite + AWS Serverless",
+            "test_framework": "Jest",
+            "backend_path": "backend",
+            "test_command": [
+                "node",
+                os.path.join("backend", "node_modules", "jest", "bin", "jest.js"),
+                "--runInBand",
+            ],
+        },
+        "architecture": {
+            "components": [{
+                "name": "frontend",
+                "path": "frontend",
+                "package_manager": "npm",
+                "build_command": "npm run build",
+            }],
+        },
+    }
+
+    blockers = workflow_orchestrator.local_execution_blockers(context)
+
+    assert len(blockers) == 2
+    assert any("Jest runner is missing" in blocker for blocker in blockers)
+    assert any("Build dependencies are missing" in blocker for blocker in blockers)
+
+
+def test_local_workflow_environment_disables_aws_credential_discovery(monkeypatch):
+    monkeypatch.setenv("AWS_ACCESS_KEY_ID", "test-access-key")
+    monkeypatch.setenv("AWS_SECRET_ACCESS_KEY", "test-secret-key")
+    monkeypatch.setenv("AWS_PROFILE", "test-profile")
+
+    environment = workflow_orchestrator.local_workflow_environment()
+
+    assert "AWS_ACCESS_KEY_ID" not in environment
+    assert "AWS_SECRET_ACCESS_KEY" not in environment
+    assert "AWS_PROFILE" not in environment
+    assert environment["AWS_EC2_METADATA_DISABLED"] == "true"
+    assert environment["AWS_SHARED_CREDENTIALS_FILE"] == os.devnull
+    assert os.environ["AWS_ACCESS_KEY_ID"] == "test-access-key"
+
+
+@pytest.mark.parametrize(
+    "test_result",
+    [
+        {"status": "PASSED", "return_code": 0},
+        {"status": "PASSED", "return_code": 0, "tests": 0, "passed": 0, "failed": 0},
+        {"status": "PASSED", "return_code": 0, "tests": 3, "passed": 2, "failed": 0},
+        {"status": "PASSED", "return_code": 0, "tests": 3, "passed": 3, "failed": 0, "skipped": 1},
+    ],
+)
+def test_test_result_validator_rejects_missing_or_incomplete_test_counts(
+    tmp_path, monkeypatch, test_result
+):
+    result_path = tmp_path / "test_result.json"
+    result_path.write_text(json.dumps(test_result), encoding="utf-8")
+    monkeypatch.setattr(workflow_orchestrator, "TEST_RESULT_FILE", os.fspath(result_path))
+
+    assert workflow_orchestrator.validate_test_result() is False
+
+
+def test_test_result_validator_requires_a_nonempty_fully_passing_run(
+    tmp_path, monkeypatch
+):
+    result_path = tmp_path / "test_result.json"
+    result_path.write_text(json.dumps({
+        "status": "PASSED",
+        "return_code": 0,
+        "tests": 3,
+        "passed": 3,
+        "failed": 0,
+        "skipped": 0,
+    }), encoding="utf-8")
+    monkeypatch.setattr(workflow_orchestrator, "TEST_RESULT_FILE", os.fspath(result_path))
+
+    assert workflow_orchestrator.validate_test_result() is True
+
+
+@pytest.mark.parametrize(
+    ("output", "expected"),
+    [
+        ("ℹ tests 3\nℹ pass 3\nℹ fail 0\nℹ skipped 0\nℹ todo 0", (3, 3, 0, 0)),
+        # node:test TAP reporter (stdout is a pipe), with a Node warning comment
+        (
+            "TAP version 13\n# (node:1) [MODULE_TYPELESS_PACKAGE_JSON] Warning: x\n"
+            "# Subtest: whitespace task\nok 1 - whitespace task\n1..1\n"
+            "# tests 1\n# suites 0\n# pass 1\n# fail 0\n# cancelled 0\n# skipped 0\n# todo 0\n",
+            (1, 1, 0, 0),
+        ),
+        ("# tests 2\n# pass 1\n# fail 1\n# skipped 0\n# todo 0", (2, 1, 1, 0)),
+        ("Tests: 3 passed, 3 total", (3, 3, 0, 0)),
+        ("Tests: 2 passed, 1 skipped, 3 total", (3, 2, 0, 1)),
+        ("3 passed, 1 skipped in 0.12s", (4, 3, 0, 1)),
+        ("Tests run: 4, Failures: 0, Errors: 0, Skipped: 0", (4, 4, 0, 0)),
+        ("Passed! - Failed: 0, Passed: 4, Skipped: 0, Total: 4", (4, 4, 0, 0)),
+        ("Ran 2 tests\n\nOK", (2, 2, 0, 0)),
+        ("Ran 3 tests\n\nOK (skipped=1)", (3, 2, 0, 1)),
+        ("Ran 3 tests\n\nFAILED (failures=1, skipped=1)", (3, 1, 1, 1)),
+        ("4 passing (12ms)", (4, 4, 0, 0)),
+        ("Executed 4 of 4 SUCCESS", (4, 4, 0, 0)),
+        ("Executed 3 of 4 SUCCESS (1 SKIPPED)", (4, 3, 0, 1)),
+    ],
+)
+def test_test_summary_parser_supports_detected_frameworks(output, expected):
+    assert parse_test_summary(output) == expected
+
+
+def test_test_summary_parser_does_not_infer_pass_from_exit_text_alone():
+    assert parse_test_summary("build succeeded; no tests found") == (
+        None,
+        None,
+        None,
+        None,
+    )
+
+
+@pytest.mark.parametrize(
+    "output",
+    [
+        "Tests: 2 passed, 3 total",
+        "Tests: 1 failed, 2 passed, 2 total",
+        "ℹ tests 3\nℹ pass 3\nℹ fail 0\nℹ skipped 2\nℹ todo 0",
+        "Tests run: 4, Failures: 0, Errors: 0, Skipped: 5",
+    ],
+)
+def test_test_summary_parser_rejects_incomplete_or_contradictory_counts(output):
+    assert parse_test_summary(output) == (None, None, None, None)
+
+
+def test_project_process_environment_omits_credentials_but_keeps_runtime_values():
+    source = {
+        "PATH": "local-runtime-path",
+        "SYSTEMROOT": "local-system-root",
+        "VIRTUAL_ENV": "local-venv",
+        "PORT": "5050",
+        "REPRODUCTION_BASE_URL": "http://127.0.0.1:5050",
+        "GROQ_API_KEY": "do-not-pass-to-project-process",
+        "DATABASE_URL": "do-not-pass-to-project-process",
+        "AWS_ACCESS_KEY_ID": "do-not-pass-to-project-process",
+    }
+
+    environment = project_process_environment(source)
+
+    assert environment["PATH"] == "local-runtime-path"
+    assert environment["SYSTEMROOT"] == "local-system-root"
+    assert environment["VIRTUAL_ENV"] == "local-venv"
+    assert environment["PORT"] == "5050"
+    assert environment["REPRODUCTION_BASE_URL"] == "http://127.0.0.1:5050"
+    assert environment["NPM_CONFIG_USERCONFIG"] != environment["NPM_CONFIG_GLOBALCONFIG"]
+    assert not os.path.exists(environment["NPM_CONFIG_USERCONFIG"])
+    assert not os.path.exists(environment["NPM_CONFIG_GLOBALCONFIG"])
+    assert "GROQ_API_KEY" not in environment
+    assert "DATABASE_URL" not in environment
+    assert "AWS_ACCESS_KEY_ID" not in environment
+
+
+def test_project_process_environment_allowlists_essential_local_variables():
+    environment = project_process_environment({
+        "PATH": "runtime-path",
+        "SYSTEMROOT": "windows-root",
+        "TEMP": "temp-dir",
+        "VIRTUAL_ENV": "python-venv",
+        "JAVA_HOME": "java-home",
+        "DOTNET_ROOT": "dotnet-root",
+        "PORT": "5050",
+        "REPRODUCTION_BASE_URL": "http://127.0.0.1:5050",
+        "GROQ_API_KEY": "must-not-pass",
+        "DATABASE_URL": "must-not-pass",
+        "CUSTOM_SECRET": "must-not-pass",
+    })
+
+    assert environment["PATH"] == "runtime-path"
+    assert environment["SYSTEMROOT"] == "windows-root"
+    assert environment["TEMP"] == "temp-dir"
+    assert environment["VIRTUAL_ENV"] == "python-venv"
+    assert environment["JAVA_HOME"] == "java-home"
+    assert environment["DOTNET_ROOT"] == "dotnet-root"
+    assert environment["PORT"] == "5050"
+    assert environment["REPRODUCTION_BASE_URL"] == "http://127.0.0.1:5050"
+    assert environment["npm_config_offline"] == "true"
+    assert all(
+        name not in environment
+        for name in ("GROQ_API_KEY", "DATABASE_URL", "CUSTOM_SECRET")
+    )
+
+
+def test_local_reproduction_install_and_app_receive_sanitized_environment(
+    tmp_path, monkeypatch
+):
+    reproduction_agent = load_bug_reproduction_agent_module(monkeypatch)
+    application = tmp_path / "application"
+    application.mkdir()
+    (application / "package.json").write_text("{}", encoding="utf-8")
+    monkeypatch.setenv("GROQ_API_KEY", "must-not-reach-project-child")
+    monkeypatch.setenv("DATABASE_URL", "must-not-reach-project-child")
+    captured = []
+
+    def fake_install(_command, **kwargs):
+        captured.append(("install", kwargs["env"]))
+        return SimpleNamespace(returncode=0, stdout="", stderr="")
+
+    class RunningProcess:
+        def poll(self):
+            return None
+
+    def fake_start(_command, **kwargs):
+        captured.append(("application", kwargs["env"]))
+        return RunningProcess()
+
+    monkeypatch.setattr(reproduction_agent.subprocess, "run", fake_install)
+    monkeypatch.setattr(reproduction_agent.subprocess, "Popen", fake_start)
+    monkeypatch.setattr(
+        reproduction_agent,
+        "http_request",
+        lambda *_args, **_kwargs: {"success": True, "status_code": 200},
+    )
+    monkeypatch.setattr(reproduction_agent.time, "sleep", lambda *_args: None)
+
+    process, error = reproduction_agent.start_application(
+        os.fspath(application),
+        "node app.js",
+        base_url="http://127.0.0.1:5050",
+        environment={
+            "PORT": "5050",
+            "DATABASE_URL": "must-not-reach-project-child",
+        },
+    )
+
+    assert process is not None
+    assert error is None
+    assert [name for name, _env in captured] == ["install", "application"]
+    assert "PORT" not in captured[0][1]
+    assert captured[1][1]["PORT"] == "5050"
+    for _name, child_environment in captured:
+        assert "GROQ_API_KEY" not in child_environment
+        assert "DATABASE_URL" not in child_environment
+        assert child_environment["npm_config_offline"] == "true"
+
+
+def test_test_result_checker_preserves_skipped_summary_counts():
+    assert test_result_checker.parse_node_test_summary(
+        "Tests: 2 passed, 1 skipped, 3 total"
+    ) == (3, 2, 0, 1)
+
+
+@pytest.mark.parametrize(
+    "generation_result",
+    [
+        {
+            "status": "SUCCESS",
+            "return_code": 0,
+            "tests": 3,
+            "passed": 2,
+            "failed": 0,
+            "skipped": 1,
+            "configured_http_reproduction": True,
+        },
+        {
+            "status": "SUCCESS",
+            "return_code": 0,
+            "tests": 3,
+            "passed": 3,
+            "failed": 0,
+            "skipped": 1,
+            "configured_http_reproduction": True,
+        },
+        {
+            "status": "SUCCESS",
+            "return_code": 0,
+            "tests": 3,
+            "passed": 2,
+            "failed": 0,
+            "configured_http_reproduction": True,
+        },
+    ],
+)
+def test_http_test_checker_requires_and_preserves_complete_test_counts(
+    tmp_path, monkeypatch, generation_result
+):
+    context_path = tmp_path / "repository_context.json"
+    generation_path = tmp_path / "test_generation_result.json"
+    result_path = tmp_path / "test_result.json"
+    context_path.write_text(
+        json.dumps({"repository_path": os.fspath(tmp_path)}),
+        encoding="utf-8",
+    )
+    generation_path.write_text(json.dumps(generation_result), encoding="utf-8")
+    monkeypatch.setattr(test_result_checker, "CONTEXT_PATH", os.fspath(context_path))
+    monkeypatch.setattr(
+        test_result_checker,
+        "TEST_GENERATION_RESULT_PATH",
+        os.fspath(generation_path),
+    )
+    monkeypatch.setattr(test_result_checker, "OUTPUT_PATH", os.fspath(result_path))
+
+    with pytest.raises(SystemExit) as exit_info:
+        test_result_checker.main()
+
+    result = json.loads(result_path.read_text(encoding="utf-8"))
+    should_pass = generation_result.get("skipped") == 1 and generation_result["passed"] == 2
+    assert result["status"] == ("PASSED" if should_pass else "FAILED")
+    assert result.get("skipped") == generation_result.get("skipped")
+    assert exit_info.value.code == (0 if should_pass else 1)
+
+
+@pytest.mark.parametrize(
+    ("test_result", "expected_status"),
+    [
+        ({"status": "PASSED", "return_code": 0, "tests": 3, "passed": 2, "failed": 0, "skipped": 1}, "PASS"),
+        ({"status": "PASSED", "return_code": 0, "tests": 3, "passed": 3, "failed": 0, "skipped": 1}, "FAIL"),
+        ({"status": "PASSED", "return_code": 0, "tests": 3, "passed": 0, "failed": 0, "skipped": 3}, "FAIL"),
+    ],
+)
+def test_verification_agent_validates_skipped_and_incomplete_test_counts(
+    tmp_path, monkeypatch, test_result, expected_status
+):
+    run_dir = tmp_path / "verification-run"
+    run_dir.mkdir()
+    monkeypatch.setenv(ARTIFACT_DIR_ENV, os.fspath(run_dir))
+    (run_dir / "repository_context.json").write_text(json.dumps({
+        "execution_strategy": {
+            "test_command": ["node", "test.js"],
+            "validation_method": "Jest",
+        },
+        "architecture": {"components": []},
+    }), encoding="utf-8")
+    (run_dir / "test_result.json").write_text(json.dumps(test_result), encoding="utf-8")
+    spec = importlib.util.spec_from_file_location(
+        f"verification_agent_count_test_{expected_status}_{test_result['passed']}",
+        Path(__file__).resolve().parents[1] / "verification_agent.py",
+    )
+    assert spec is not None and spec.loader is not None
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+
+    report = json.loads((run_dir / "verification_report.json").read_text(encoding="utf-8"))
+    assert report["status"] == expected_status
+
+
+def test_verification_evidence_helpers_reject_status_only_results():
+    from workflow_validation import (
+        build_result_has_success_evidence,
+        runtime_result_has_success_evidence,
+        test_result_has_success_evidence,
+    )
+
+    assert not test_result_has_success_evidence({"status": "PASSED", "return_code": 0})
+    assert not build_result_has_success_evidence(
+        {"status": "PASSED", "return_code": 0},
+        expected_components=1,
+    )
+    assert not runtime_result_has_success_evidence(
+        {"status": "PASSED", "return_code": 0}
+    )
+
+
+def test_component_build_is_blocked_without_local_dependencies(
+    tmp_path, monkeypatch
+):
+    repository = tmp_path / "repo"
+    backend = repository / "backend"
+    backend.mkdir(parents=True)
+    (backend / "package.json").write_text("{}", encoding="utf-8")
+    (backend / "package-lock.json").write_text("{}", encoding="utf-8")
+    build_result_path = tmp_path / "build_result.json"
+    monkeypatch.setattr(workflow_orchestrator, "BUILD_RESULT_FILE", os.fspath(build_result_path))
+    monkeypatch.setattr(
+        workflow_orchestrator,
+        "run_bounded",
+        lambda *_args, **_kwargs: pytest.fail("Build stage must not install or run without local dependencies."),
+    )
+    context = {
+        "repository_path": os.fspath(repository),
+        "architecture": {
+            "components": [{
+                "name": "backend",
+                "path": "backend",
+                "package_manager": "npm",
+                "build_command": "npm run build",
+            }],
+        },
+    }
+
+    result = workflow_orchestrator.run_component_builds(context)
+
+    assert result["status"] == "BLOCKED"
+    assert "installation is disabled" in result["components"][0]["reason"]
+
+
+def test_component_build_uses_offline_environment_without_aws_credentials(
+    tmp_path, monkeypatch
+):
+    repository = tmp_path / "repo"
+    frontend = repository / "frontend"
+    (frontend / "node_modules").mkdir(parents=True)
+    (frontend / "package.json").write_text("{}", encoding="utf-8")
+    monkeypatch.setenv("AWS_ACCESS_KEY_ID", "test-access-key")
+    monkeypatch.setenv("AWS_SECRET_ACCESS_KEY", "test-secret-key")
+    monkeypatch.setattr(
+        workflow_orchestrator,
+        "BUILD_RESULT_FILE",
+        os.fspath(tmp_path / "build_result.json"),
+    )
+    captured = {}
+
+    def fake_run(command, **kwargs):
+        captured.update(kwargs)
+        return SimpleNamespace(returncode=0, stdout="built", stderr="")
+
+    monkeypatch.setattr(workflow_orchestrator, "run_bounded", fake_run)
+    context = {
+        "repository_path": os.fspath(repository),
+        "architecture": {
+            "components": [{
+                "name": "frontend",
+                "path": "frontend",
+                "package_manager": "npm",
+                "build_command": "npm run build",
+            }],
+        },
+    }
+
+    result = workflow_orchestrator.run_component_builds(context)
+
+    assert result["status"] == "PASSED"
+    assert captured["env"]["npm_config_offline"] == "true"
+    assert "AWS_ACCESS_KEY_ID" not in captured["env"]
+    assert "AWS_SECRET_ACCESS_KEY" not in captured["env"]
 
 
 def test_orchestrator_preserves_standalone_diagnosis_and_fix_result_paths(
@@ -2028,6 +2636,48 @@ def test_execution_strategy_preserves_generic_node_and_mern_defaults(monkeypatch
     assert mern_strategy["test_command"] == "npm test"
 
 
+def test_dynamodb_message_fallback_generates_behavior_specific_jest_test():
+    diagnosis = {
+        "bug_title": "WebSocket messages overwrite previous records",
+        "root_cause": "DynamoDB uses no sort key for each message.",
+    }
+
+    source = test_generation_agent.build_dynamodb_message_regression_test(
+        diagnosis,
+        has_node_backend=True,
+        handler_import="../src/websocket",
+        config_relative_path="../serverless.yml",
+    )
+
+    assert source is not None
+    assert 'require("../src/websocket")' in source
+    # Key attributes come from serverless.yml, not a hard-coded "messageId".
+    assert "new Set(keys).size).toBe(2)" in source
+    assert 'line.trim() === "KeySchema:"' in source
+    assert "messageId" not in source
+    assert "empty tasks" not in source
+
+
+def test_dynamodb_message_fallback_rejects_unrelated_or_non_node_diagnoses():
+    diagnosis = {
+        "bug_title": "WebSocket messages overwrite previous records",
+        "root_cause": "DynamoDB uses no sort key for each message.",
+    }
+
+    assert test_generation_agent.build_dynamodb_message_regression_test(
+        diagnosis,
+        has_node_backend=False,
+        handler_import="../src/websocket",
+        config_relative_path="../serverless.yml",
+    ) is None
+    assert test_generation_agent.build_dynamodb_message_regression_test(
+        {"bug_title": "Button color is incorrect"},
+        has_node_backend=True,
+        handler_import="../src/websocket",
+        config_relative_path="../serverless.yml",
+    ) is None
+
+
 def test_repository_agent_keeps_positional_github_url_compatibility(monkeypatch):
     repository_agent = load_repository_agent_module(monkeypatch)
     github_url = "https://github.com/example/legacy-project.git"
@@ -2049,7 +2699,7 @@ def test_validation_only_runs_only_offline_local_commands(tmp_path, monkeypatch)
         calls.append((command, kwargs))
         return SimpleNamespace(returncode=0, stdout="passed", stderr="")
 
-    monkeypatch.setattr(workflow_orchestrator.subprocess, "run", fake_run)
+    monkeypatch.setattr(workflow_orchestrator, "run_bounded", fake_run)
 
     result = workflow_orchestrator.run_validation_only(context)
 
@@ -2067,6 +2717,35 @@ def test_validation_only_runs_only_offline_local_commands(tmp_path, monkeypatch)
     assert all(kwargs["cwd"].startswith(os.fspath(repository)) for _, kwargs in calls)
 
 
+def test_frontend_preflight_can_leave_backend_to_post_fix_verification(
+    tmp_path, monkeypatch
+):
+    repository = tmp_path / "repository"
+    context = create_validation_repository(repository)
+    run_dir = tmp_path / "run"
+    run_dir.mkdir()
+    workflow_orchestrator.configure_run_artifact_paths(os.fspath(run_dir))
+    calls = []
+
+    def fake_run(command, **kwargs):
+        calls.append(command)
+        return SimpleNamespace(returncode=0, stdout="passed", stderr="")
+
+    monkeypatch.setattr(workflow_orchestrator, "run_bounded", fake_run)
+
+    result = workflow_orchestrator.run_validation_only(
+        context,
+        include_backend_tests=False,
+    )
+
+    assert result["status"] == "PASSED"
+    assert [command[0] for command in calls] == ["npm.cmd", "npm.cmd"]
+    assert [check["name"] for check in result["checks"]] == [
+        "frontend_build",
+        "frontend_lint",
+    ]
+
+
 def test_validation_only_requires_installed_local_jest_runner(tmp_path, monkeypatch):
     repository = tmp_path / "repository"
     context = create_validation_repository(repository)
@@ -2077,8 +2756,8 @@ def test_validation_only_requires_installed_local_jest_runner(tmp_path, monkeypa
     workflow_orchestrator.configure_run_artifact_paths(os.fspath(run_dir))
     calls = []
     monkeypatch.setattr(
-        workflow_orchestrator.subprocess,
-        "run",
+        workflow_orchestrator,
+        "run_bounded",
         lambda command, **_kwargs: calls.append(command)
         or SimpleNamespace(returncode=0, stdout="", stderr=""),
     )
@@ -2149,8 +2828,8 @@ def test_validation_only_main_stops_after_analysis_and_isolates_artifacts(
 
     monkeypatch.setattr(workflow_orchestrator, "run_agent", fake_run_agent)
     monkeypatch.setattr(
-        workflow_orchestrator.subprocess,
-        "run",
+        workflow_orchestrator,
+        "run_bounded",
         lambda *_args, **_kwargs: SimpleNamespace(
             returncode=0,
             stdout="passed",
@@ -2256,12 +2935,21 @@ def test_level3_demo_reproduces_fixes_and_verifies_disposable_copy(
     assert result["network_calls"] is False
     baseline_test_result = result["stages"][0]["details"]["test_result"]
     baseline_output = baseline_test_result["stdout"] + baseline_test_result["stderr"]
-    assert baseline_test_result["tests"] == 12
+    assert baseline_test_result["tests"] == 13
     assert baseline_test_result["passed"] == 11
-    assert baseline_test_result["failed"] == 1
+    assert baseline_test_result["failed"] == 2
     assert "Expected: 2" in baseline_output
     assert "Received: 1" in baseline_output
     assert result["attempts"][0]["verified"] is True
+    assert result["attempts"][0]["fix_result"]["changed"] is True
+    assert result["attempts"][0]["fix_result"]["reread_verified"] is True
+    already_present = local_websocket_demo.apply_message_retention_fix(
+        os.fspath(demo_repository),
+        2,
+    )
+    assert already_present["modified_files"] == []
+    assert already_present["changed"] is False
+    assert already_present["reread_verified"] is True
     assert "messageId" in demo_handler.read_text(encoding="utf-8")
     assert "messageId" in demo_schema.read_text(encoding="utf-8")
     assert all(path.read_bytes() == content for path, content in source_before.items())
@@ -2282,9 +2970,9 @@ def test_level3_demo_retries_after_post_fix_verification_failure(
     run_dir = tmp_path / "workflow_runs" / "retry-run"
     run_dir.mkdir(parents=True)
     outputs = [
-        (1, "FAIL Level 3 demo retains each accepted message\nExpected: 2\nReceived: 1\nTests: 1 failed, 12 total"),
-        (1, "Tests: 1 failed, 12 total"),
-        (0, "Tests: 12 passed, 12 total"),
+        (1, "FAIL Level 3 demo retains each accepted message\nExpected: 2\nReceived: 1\nTests: 2 failed, 13 total"),
+        (1, "Tests: 2 failed, 13 total"),
+        (0, "Tests: 13 passed, 13 total"),
     ]
     calls = []
 
@@ -2318,10 +3006,10 @@ def test_level3_demo_does_not_accept_passing_command_without_semantic_fix(
     run_dir = tmp_path / "workflow_runs" / "unverified-run"
     run_dir.mkdir(parents=True)
     outputs = [
-        (1, "FAIL Level 3 demo retains each accepted message\nExpected: 2\nReceived: 1\nTests: 1 failed, 12 total"),
-        (0, "Tests: 12 passed, 12 total"),
-        (0, "Tests: 12 passed, 12 total"),
-        (0, "Tests: 12 passed, 12 total"),
+        (1, "FAIL Level 3 demo retains each accepted message\nExpected: 2\nReceived: 1\nTests: 2 failed, 13 total"),
+        (0, "Tests: 13 passed, 13 total"),
+        (0, "Tests: 13 passed, 13 total"),
+        (0, "Tests: 13 passed, 13 total"),
     ]
     call_count = 0
 
@@ -2334,7 +3022,9 @@ def test_level3_demo_does_not_accept_passing_command_without_semantic_fix(
     def no_op_fixer(_demo_repository, _attempt):
         return {
             "status": "SUCCESS",
-            "modified_files": ["backend/src/websocket.js"],
+            "modified_files": [],
+            "changed": False,
+            "reread_verified": False,
         }
 
     result = local_websocket_demo.run_level3_websocket_demo(
@@ -2550,7 +3240,7 @@ def test_groq_diagnosis_failure_is_not_replaced_by_deterministic_fix(
     run_dir = tmp_path / "workflow_runs" / "ai-failure"
     run_dir.mkdir(parents=True)
     command_outputs = [
-        (1, "FAIL Level 3 demo retains each accepted message\nExpected: 2\nReceived: 1\nTests: 1 failed, 12 total"),
+        (1, "FAIL Level 3 demo retains each accepted message\nExpected: 2\nReceived: 1\nTests: 2 failed, 13 total"),
     ]
     command_calls = []
     fixer = Mock()
@@ -2619,8 +3309,8 @@ def test_groq_diagnosis_opt_in_records_only_diagnosis_as_ai_powered(
     run_dir = tmp_path / "workflow_runs" / "ai-success"
     run_dir.mkdir(parents=True)
     command_outputs = [
-        (1, "FAIL Level 3 demo retains each accepted message\nExpected: 2\nReceived: 1\nTests: 1 failed, 12 total"),
-        (0, "Tests: 12 passed, 12 total"),
+        (1, "FAIL Level 3 demo retains each accepted message\nExpected: 2\nReceived: 1\nTests: 2 failed, 13 total"),
+        (0, "Tests: 13 passed, 13 total"),
     ]
     command_calls = []
 
@@ -2748,7 +3438,7 @@ def test_orchestrator_persists_ai_diagnosis_metadata_in_workflow_report(
     monkeypatch.setattr(
         workflow_orchestrator,
         "run_validation_only",
-        lambda _context: {"status": "PASSED", "checks": []},
+        lambda _context, **_kwargs: {"status": "PASSED", "checks": []},
     )
     monkeypatch.setattr(
         workflow_orchestrator,
@@ -2909,6 +3599,7 @@ def run_mocked_retry_workflow(
     preexisting_manual_artifact=False,
     manual_save_failure=False,
     diagnosis_error=None,
+    context_override=None,
 ):
     base_dir = tmp_path / "workflow-root"
     base_dir.mkdir()
@@ -2948,7 +3639,7 @@ def run_mocked_retry_workflow(
         "argv",
         ["workflow_orchestrator.py", "--local-repository", os.fspath(repository)],
     )
-    context = {
+    context = context_override or {
         "repository_path": os.fspath(repository),
         "execution_strategy": {"technology": "Python", "test_command": "pytest"},
         "architecture": {"components": []},
@@ -3008,7 +3699,7 @@ def run_mocked_retry_workflow(
         elif name == "bug_diagnosis_agent":
             calls["bug_diagnosis"] += 1
             diagnosis_arguments_seen.append(arguments or [])
-            if arguments and arguments[0] != "--manual-reproduction":
+            if arguments and not arguments[0].startswith("--"):
                 retry_report = workflow_orchestrator.load_json(arguments[0])
                 retry_failure_contexts.append(retry_report.get("failure_context", {}))
             if diagnosis_error:
@@ -3047,7 +3738,20 @@ def run_mocked_retry_workflow(
             failed = failure_stage == "verification" and calls["verification"] in failed_attempts
             workflow_orchestrator.save_json(
                 workflow_orchestrator.VERIFICATION_REPORT_FILE,
-                {"status": "FAIL" if failed else "PASS", "reason": ["mock"]},
+                {
+                    "status": "FAIL" if failed else "PASS",
+                    "return_code": 1 if failed else 0,
+                    "reason": ["mock"],
+                    "test_result": workflow_orchestrator.load_json(
+                        workflow_orchestrator.TEST_RESULT_FILE
+                    ),
+                    "build_result": workflow_orchestrator.load_json(
+                        workflow_orchestrator.BUILD_RESULT_FILE
+                    ),
+                    "validation_result": workflow_orchestrator.load_json(
+                        workflow_orchestrator.VALIDATION_RESULT_FILE
+                    ),
+                },
             )
         return {"success": True, "return_code": 0}
 
@@ -3071,7 +3775,15 @@ def run_mocked_retry_workflow(
     def fake_runtime(_initial_reproduction):
         calls["runtime"] += 1
         failed = failure_stage == "runtime_validation" and calls["runtime"] in failed_attempts
-        result = {"status": "FAILED" if failed else "PASSED", "return_code": 1 if failed else 0}
+        result = (
+            {"status": "FAILED", "return_code": 1}
+            if failed
+            else {
+                "status": "SKIPPED",
+                "return_code": 0,
+                "message": "No configured HTTP reproduction requires runtime validation.",
+            }
+        )
         workflow_orchestrator.save_json(workflow_orchestrator.VALIDATION_RESULT_FILE, result)
         return result
 
@@ -3102,6 +3814,54 @@ def run_mocked_retry_workflow(
     return workflow_orchestrator.main(), run_dir, calls, retry_failure_contexts
 
 
+def test_orchestrator_blocks_before_code_fix_when_local_runners_are_missing(
+    tmp_path, monkeypatch
+):
+    repository = tmp_path / "workflow-root" / "target-project"
+    context = {
+        "repository_path": os.fspath(repository),
+        "execution_strategy": {
+            "technology": "React/Vite + AWS Serverless",
+            "test_framework": "Jest",
+            "backend_path": "backend",
+            "test_command": [
+                "node",
+                os.path.join("backend", "node_modules", "jest", "bin", "jest.js"),
+                "--runInBand",
+            ],
+        },
+        "architecture": {
+            "components": [{
+                "name": "frontend",
+                "path": "frontend",
+                "package_manager": "npm",
+                "build_command": "npm run build",
+            }],
+        },
+    }
+
+    result, run_dir, calls, _retry_contexts = run_mocked_retry_workflow(
+        tmp_path,
+        monkeypatch,
+        context_override=context,
+    )
+
+    report = json.loads((run_dir / "workflow_report.json").read_text(encoding="utf-8"))
+    preflight = next(
+        stage for stage in report["stages"]
+        if stage["name"] == "Pre-fix Local Dependency Preflight"
+    )
+
+    assert result == 1
+    assert report["final_status"] == "BLOCKED"
+    assert report["deployment_status"] == "NOT_DEPLOYED"
+    assert report["deployment_readiness"] == "NOT_ASSESSED"
+    assert preflight["status"] == "BLOCKED"
+    assert calls["code_fix"] == 0
+    assert calls["test_generation"] == 0
+    assert calls["test_execution"] == 0
+
+
 def set_manual_reproduction_input(monkeypatch, answers):
     monkeypatch.setattr(
         workflow_orchestrator.sys,
@@ -3124,6 +3884,7 @@ def test_orchestrator_manual_reproduction_continues_through_fix_and_verification
         "A blank task appears",
         "ValidationError: task is required",
         "",
+        "approve",
     ])
     result, run_dir, calls, _retry_contexts = run_mocked_retry_workflow(
         tmp_path,
@@ -3141,6 +3902,9 @@ def test_orchestrator_manual_reproduction_continues_through_fix_and_verification
 
     assert result == 0
     assert report["final_status"] == "PASS"
+    # Manual-only reproduction: the fix needed a human approval.
+    assert report["fix_review"]["decision"] == "approve"
+    assert report["reproduction_confirmed"] is False
     assert report["reproduction_source"] == "manual"
     assert report["reproduction_evidence"]["automatic_result_ref"] == "reproduction_result.json"
     assert report["reproduction_evidence"]["manual_report_ref"] == "manual_reproduction.json"
@@ -3173,7 +3937,7 @@ def test_manual_reproduction_context_is_preserved_for_retry_diagnosis(
     set_manual_reproduction_input(monkeypatch, [
         "yes", "Open the task page", "Submit a blank task", "",
         "The task should be rejected", "A blank task appears",
-        "ValidationError: task is required", "",
+        "ValidationError: task is required", "", "approve",
     ])
     result, run_dir, calls, retry_contexts = run_mocked_retry_workflow(
         tmp_path,
@@ -3188,6 +3952,9 @@ def test_manual_reproduction_context_is_preserved_for_retry_diagnosis(
 
     assert result == 0
     assert report["final_status"] == "PASS"
+    # Manual-only reproduction: the fix needed a human approval.
+    assert report["fix_review"]["decision"] == "approve"
+    assert report["reproduction_confirmed"] is False
     assert [item["overall"] for item in report["retry_history"]] == ["FAIL", "PASS"]
     assert calls["bug_diagnosis"] == 2
     assert calls["code_fix"] == 2
@@ -3222,7 +3989,7 @@ def test_manual_reproduction_continues_when_automatic_artifact_is_unavailable_or
     set_manual_reproduction_input(monkeypatch, [
         "yes", "Open the task page", "Submit a blank task", "",
         "The task should be rejected", "A blank task appears",
-        "ValidationError: task is required", "",
+        "ValidationError: task is required", "", "approve",
     ])
     result, run_dir, calls, _retry_contexts = run_mocked_retry_workflow(
         tmp_path,
@@ -3237,6 +4004,9 @@ def test_manual_reproduction_continues_when_automatic_artifact_is_unavailable_or
 
     assert result == 0
     assert report["final_status"] == "PASS"
+    # Manual-only reproduction: the fix needed a human approval.
+    assert report["fix_review"]["decision"] == "approve"
+    assert report["reproduction_confirmed"] is False
     assert report["reproduction_source"] == "manual"
     assert report["reproduction_evidence"]["manual_report_ref"] == "manual_reproduction.json"
     assert stage["status"] == "MANUAL_CAPTURED"
@@ -3329,6 +4099,38 @@ def test_orchestrator_stops_when_manual_reproduction_is_insufficient(
     assert not (run_dir / "manual_reproduction.json").exists()
     assert calls["bug_diagnosis"] == 0
     assert calls["code_fix"] == 0
+
+
+def test_manual_reproduction_reprompts_blank_outcomes_and_accepts_unverified(
+    tmp_path, monkeypatch
+):
+    run_dir = tmp_path / "workflow_runs" / "manual-reprompt"
+    run_dir.mkdir(parents=True)
+    monkeypatch.setattr(
+        workflow_orchestrator,
+        "ACTIVE_RUN_ARTIFACT_DIR",
+        os.fspath(run_dir),
+    )
+    set_manual_reproduction_input(monkeypatch, [
+        "yes",
+        "Connect one WebSocket client",
+        "",
+        "",
+        "Each message should be stored as a separate record",
+        "",
+        "not verified; I have not inspected DynamoDB yet",
+        "",
+    ])
+
+    result = workflow_orchestrator.collect_manual_reproduction(
+        {"status": "EXECUTION_ERROR"}
+    )
+
+    manual = json.loads((run_dir / "manual_reproduction.json").read_text(encoding="utf-8"))
+    assert result["status"] == "CAPTURED"
+    assert manual["steps"] == ["Connect one WebSocket client"]
+    assert manual["expected_behavior"] == "Each message should be stored as a separate record"
+    assert manual["observed_behavior"].startswith("not verified")
 
 
 def test_orchestrator_stops_when_manual_reproduction_is_cancelled(
@@ -3653,3 +4455,44 @@ def test_langfuse_missing_credentials_disables_tracing_gracefully(monkeypatch):
 
     assert workflow_orchestrator.get_optional_langfuse_client() is None
     dotenv_module.load_dotenv.assert_called_once_with()
+
+def test_ai_tests_for_a_workflow_started_app_reuse_the_generation_result(tmp_path, monkeypatch):
+    context_path = tmp_path / "repository_context.json"
+    generation_path = tmp_path / "test_generation_result.json"
+    result_path = tmp_path / "test_result.json"
+    context_path.write_text(json.dumps({"repository_path": os.fspath(tmp_path)}), encoding="utf-8")
+    generation_path.write_text(json.dumps({
+        "status": "SUCCESS", "return_code": 0, "tests": 1, "passed": 1, "failed": 0, "skipped": 0,
+        "test_command": "node --test", "workflow_started_app": True,
+    }), encoding="utf-8")
+    monkeypatch.setattr(test_result_checker, "CONTEXT_PATH", os.fspath(context_path))
+    monkeypatch.setattr(test_result_checker, "TEST_GENERATION_RESULT_PATH", os.fspath(generation_path))
+    monkeypatch.setattr(test_result_checker, "OUTPUT_PATH", os.fspath(result_path))
+    monkeypatch.setattr(test_result_checker, "run_bounded", lambda *a, **k: pytest.fail("must not rerun without the app"))
+
+    with pytest.raises(SystemExit) as exit_info:
+        test_result_checker.main()
+
+    result = json.loads(result_path.read_text(encoding="utf-8"))
+    assert exit_info.value.code == 0
+    assert result["status"] == "PASSED"
+    assert result["command"] == "node --test"
+
+
+def test_preflight_requires_jest_only_when_the_project_uses_it(tmp_path):
+    server = tmp_path / "mern" / "server"
+    server.mkdir(parents=True)
+    (server / "package.json").write_text(json.dumps({"dependencies": {"express": "^4"}}), encoding="utf-8")
+    context = {
+        "repository_path": os.fspath(tmp_path),
+        "execution_strategy": {"test_framework": "Cypress / Jest", "test_command": "npm test", "backend_path": "mern/server"},
+    }
+    # MERN: the framework label is a guess; the server does not use Jest.
+    assert not any("Jest" in item for item in workflow_orchestrator.local_execution_blockers(context))
+
+    (server / "package.json").write_text(json.dumps({"devDependencies": {"jest": "^29"}}), encoding="utf-8")
+    assert any("Jest runner is missing" in item for item in workflow_orchestrator.local_execution_blockers(context))
+
+    context["execution_strategy"]["test_command"] = ["node", "backend/node_modules/jest/bin/jest.js"]
+    (server / "package.json").write_text("{}", encoding="utf-8")
+    assert any("Jest runner is missing" in item for item in workflow_orchestrator.local_execution_blockers(context))
