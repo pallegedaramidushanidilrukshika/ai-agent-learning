@@ -2,7 +2,9 @@
 // It never runs the uploaded recording itself: only allowlisted locator,
 // action and assertion names from the step list are called.
 //
-// Usage: node replay.mjs <steps.json> <base-url> [failure-screenshot.png]
+// Usage: node replay.mjs <steps.json> <base-url> [failure-screenshot.png] [trace.zip]
+// An empty screenshot argument skips the screenshot. The trace (DOM snapshots,
+// screenshots and network of every step) opens with `npx playwright show-trace`.
 // Prints one JSON result object on the last stdout line.
 import { readFileSync } from 'node:fs';
 
@@ -110,7 +112,7 @@ async function runAction(locator, step) {
 }
 
 async function main() {
-  const [stepsPath, baseUrlText, screenshotPath] = process.argv.slice(2);
+  const [stepsPath, baseUrlText, screenshotPath, tracePath] = process.argv.slice(2);
   const steps = JSON.parse(readFileSync(stepsPath, 'utf8'));
   const baseUrl = new URL(baseUrlText);
   if (!LOCAL_HOSTS.has(baseUrl.hostname)) throw new Error('The replay base URL must be local.');
@@ -136,8 +138,11 @@ async function main() {
   const results = [];
   let failedIndex = null;
   let failureType = null;
+  let context;
+  let traceSaved = false;
   try {
-    const context = await browser.newContext();
+    context = await browser.newContext();
+    if (tracePath) await context.tracing.start({ screenshots: true, snapshots: true });
     // The replay may only talk to the local app.
     await context.route('**/*', (route) => {
       const url = new URL(route.request().url());
@@ -176,10 +181,14 @@ async function main() {
       }
     }
   } finally {
+    if (context && tracePath) {
+      traceSaved = await context.tracing.stop({ path: tracePath }).then(() => true, () => false);
+    }
     await browser.close();
   }
   finish({
     status: 'COMPLETED',
+    trace_saved: traceSaved,
     steps_total: steps.length,
     results,
     failed_index: failedIndex,

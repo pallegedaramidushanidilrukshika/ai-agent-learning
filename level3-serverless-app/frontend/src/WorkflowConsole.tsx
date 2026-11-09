@@ -21,6 +21,7 @@ type WorkflowReport = {
   technology: string | null
   reproduction_source: string | null
   root_cause: string | null
+  ai_limit?: string | null
   stages: Stage[]
   retry_history: Array<{ attempt: number; overall: string }>
   deployment_status: string
@@ -48,6 +49,7 @@ type FixReview = {
   diff: string
   diff_truncated: boolean
   checks: Record<string, string>
+  scope_findings?: string[]
 }
 type RecordingReview = {
   kind: 'recording_result'
@@ -70,7 +72,9 @@ type Workflow = {
   report: WorkflowReport | null
   review: ReproductionReview | FixReview | RecordingReview | null
   evidence: EvidenceItem[]
+  replay_evidence?: ReplayEvidenceItem[]
 }
+type ReplayEvidenceItem = { name: string; kind: 'screenshot' | 'trace'; bytes: number }
 type ManualFields = {
   steps: string
   expected: string
@@ -497,6 +501,7 @@ function WorkflowConsole() {
             <div className="current-stage"><span className="workflow-kicker">CURRENT STAGE</span><strong>{workflow.stage}</strong><p>{stageMessage(workflow, terminal)}</p></div>
             {pollError && <div className="workflow-error" role="alert"><p>Workflow status connection failed: {pollError}</p><button className="subtle-button" type="button" onClick={retryStatusPolling}>Retry status polling</button></div>}
             <StageList stages={workflow.stages} status={workflow.status} terminal={terminal} />
+            {(workflow.replay_evidence ?? []).length > 0 && <ReplayEvidence workflowId={workflow.workflow_id} items={workflow.replay_evidence!} />}
             {workflow.report && <FinalReport report={workflow.report} />}
           </>}
         </section>
@@ -623,6 +628,7 @@ function FixReviewPanel({ review, feedback, onFeedbackChange, onDecision, pendin
     <span className="workflow-kicker">APPROVAL REQUIRED</span>
     <h3>Approve this fix?</h3>
     <p>{review.reason ?? 'The bug was not confirmed by an automated test.'} Check that the changes fix the reported bug.</p>
+    {(review.scope_findings ?? []).length > 0 && <ul className="scope-findings">{review.scope_findings!.map((finding) => <li key={finding}>{finding}</li>)}</ul>}
     <dl className="fix-checks">{Object.entries(review.checks ?? {}).map(([name, value]) => <div key={name}><dt>{name.replace('_', ' ')}</dt><dd className={value === 'PASS' ? 'ok' : 'bad'}>{value}</dd></div>)}</dl>
     <ul className="fix-files">{review.files.map((file) => <li key={file.file}><span>{file.file}</span><small>+{file.added} −{file.removed}</small></li>)}</ul>
     <pre className="review-code" tabIndex={0} aria-label="Changes made by the fix"><code>{review.diff || 'No file changes were recorded.'}</code></pre>
@@ -637,6 +643,26 @@ function FixReviewPanel({ review, feedback, onFeedbackChange, onDecision, pendin
   </div>
 }
 
+function replayLabel(name: string) {
+  if (name.startsWith('browser_replay_before_fix')) return 'Before the fix'
+  const attempt = /after_fix_attempt_(\d+)/.exec(name)
+  return attempt ? `After fix attempt ${attempt[1]}` : name
+}
+
+function ReplayEvidence({ workflowId, items }: { workflowId: string; items: ReplayEvidenceItem[] }) {
+  const url = (name: string) => `/api/workflows/${workflowId}/files/${encodeURIComponent(name)}`
+  return <div className="replay-evidence"><span className="workflow-kicker">BROWSER REPLAY EVIDENCE</span>
+    {items.filter((item) => item.kind === 'screenshot').map((item) => <figure key={item.name}>
+      <img src={url(item.name)} alt={`Page when the replay stopped (${replayLabel(item.name).toLowerCase()})`} loading="lazy" />
+      <figcaption>{replayLabel(item.name)}: the page when the replay stopped</figcaption>
+    </figure>)}
+    <ul>{items.filter((item) => item.kind === 'trace').map((item) => <li key={item.name}>
+      <a href={url(item.name)} download={item.name}>Download trace: {replayLabel(item.name)}</a> <small>{Math.max(1, Math.round(item.bytes / 1024))} KB</small>
+    </li>)}</ul>
+    <small className="evidence-hint">A trace shows every replayed step with the page before and after it. Open it with <code>npx playwright show-trace &lt;file&gt;</code> in the browser_replay folder.</small>
+  </div>
+}
+
 function stageMessage(workflow: Workflow, terminal: boolean) {
   if (workflow.blocker_reason) return workflow.blocker_reason
   if (terminal) {
@@ -644,6 +670,7 @@ function stageMessage(workflow: Workflow, terminal: boolean) {
     if (workflow.status === 'STOPPED') return 'The run was stopped safely. Completed stages and artifacts were kept. See the final report below.'
     if (workflow.status === 'BLOCKED') return 'The run ended blocked. See the final report below for what was missing.'
     if (workflow.status === 'UNCONFIRMED') return 'Checks passed, but the bug was never confirmed by an automated test and nobody approved the fix, so it is not marked as passed.'
+    if (workflow.status === 'NEEDS_REVIEW') return 'Checks passed, but the fix may change more than the bug needs and nobody approved it, so it is not marked as passed.'
     return 'The run finished without a verified fix. See the final report below for the reason.'
   }
   if (workflow.status === 'STOPPING') return 'Stopping at the next safe checkpoint. The current stage will finish first.'
@@ -677,6 +704,7 @@ function FinalReport({ report }: { report: WorkflowReport }) {
   const review = report.fix_review
   return <div className="final-report"><span className="workflow-kicker">FINAL REPORT</span>
     <dl><div><dt>Technology</dt><dd>{report.technology ?? 'Not detected'}</dd></div><div><dt>Reproduction</dt><dd>{reproduction}</dd></div>{review && <div><dt>Fix review</dt><dd>{review.decision === 'approve' ? 'Approved by user' : review.decision === 'reject' ? `Rejected: ${review.feedback ?? ''}` : 'Not reviewed'}</dd></div>}<div><dt>Deployment</dt><dd>{report.deployment_status} · {report.deployment_readiness}</dd></div></dl>
+    {report.ai_limit && <p className="workflow-error" role="status"><strong>AI limit: </strong>{report.ai_limit}</p>}
     {report.root_cause && <p className="root-cause"><strong>Root cause</strong>{report.root_cause}</p>}
     {report.retry_history.length > 0 && <p className="retry-summary">{report.retry_history.length} retry attempt{report.retry_history.length === 1 ? '' : 's'} recorded</p>}
   </div>

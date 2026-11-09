@@ -1,7 +1,7 @@
 """Replay a validated browser recording against a freshly started app.
 
     python browser_replay_agent.py --recording <recording.json> --output <result.json>
-        [--screenshot <failure.png>]
+        [--screenshot <failure.png>] [--trace <trace.zip>]
 
 The recording JSON holds the step list produced by browser_recording.py. This
 agent starts the target app from repository_context.json (same start logic
@@ -16,6 +16,7 @@ steps, stops the app, and writes a classified result:
 
 import argparse
 import contextlib
+import functools
 import glob
 import json
 import os
@@ -316,10 +317,12 @@ def parse_runner_output(stdout):
     return None
 
 
-def run_replay(steps_path, base_url, screenshot_path=None, runner=subprocess.run):
+def run_replay(steps_path, base_url, screenshot_path=None, runner=subprocess.run, trace_path=None):
     command = ["node", REPLAY_SCRIPT, steps_path, base_url]
-    if screenshot_path:
-        command.append(screenshot_path)
+    if screenshot_path or trace_path:
+        command.append(screenshot_path or "")
+    if trace_path:
+        command.append(trace_path)
     try:
         completed = runner(
             command,
@@ -484,6 +487,7 @@ def main(argv=None):
     parser.add_argument("--recording")
     parser.add_argument("--output")
     parser.add_argument("--screenshot")
+    parser.add_argument("--trace", help="save a Playwright trace (.zip) of the replay")
     arguments = parser.parse_args(argv)
     if arguments.serve:
         return serve_for_recording(arguments.serve)
@@ -506,7 +510,10 @@ def main(argv=None):
             steps_path = os.path.splitext(arguments.output)[0] + ".steps.json"
             with open(steps_path, "w", encoding="utf-8") as handle:
                 json.dump(steps, handle)
-            result = replay_recording(recording, repository_context, steps_path, arguments.screenshot)
+            replay = functools.partial(run_replay, trace_path=arguments.trace) if arguments.trace else None
+            result = replay_recording(
+                recording, repository_context, steps_path, arguments.screenshot, replay=replay,
+            )
 
     with open(arguments.output, "w", encoding="utf-8") as handle:
         json.dump(result, handle, indent=2)

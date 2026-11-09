@@ -51,7 +51,7 @@ def test_diff_is_against_the_original_before_any_attempt(tmp_path):
     assert "+const a = 3;" in result["diff"]
     assert "const a = 2;" not in result["diff"]
     assert "--- /dev/null" in result["diff"]
-    assert result["files"][0] == {"file": "src/app.js", "added": 1, "removed": 1}
+    assert result["files"][0] == {"file": "src/app.js", "added": 1, "removed": 1, "regions": 1}
 
 
 def test_diff_skips_unchanged_and_outside_files(tmp_path):

@@ -38,7 +38,14 @@ RECORDING_REQUEST_BYTES = 160 * 1024
 MAX_TITLE_LENGTH = 180
 MAX_DESCRIPTION_LENGTH = 8_000
 MAX_RETRIES = 2
-TERMINAL_STATUSES = {"PASS", "FAIL", "FAILED", "STOPPED", "BLOCKED_FINAL", "UNCONFIRMED"}
+# Browser replay evidence the console may show or download. Only these exact
+# names in the run folder are served; nothing else in the run is readable.
+REPLAY_EVIDENCE_PATTERN = re.compile(
+    r"browser_replay_(?:before_fix|after_fix_attempt_[1-9][0-9]?)_(?:failure\.png|trace\.zip)"
+)
+REPLAY_EVIDENCE_TYPES = {".png": "image/png", ".zip": "application/zip"}
+MAX_REPLAY_EVIDENCE_BYTES = 50 * 1024 * 1024
+TERMINAL_STATUSES = {"PASS", "FAIL", "FAILED", "STOPPED", "BLOCKED_FINAL", "UNCONFIRMED", "NEEDS_REVIEW"}
 # Written once the orchestrator process has exited; no further actions apply.
 TERMINAL_STATE_FIELDS = {
     "terminal": True,
@@ -364,6 +371,7 @@ class WorkflowManager:
                 "deployment_status": report.get("deployment_status", "NOT_DEPLOYED"),
                 "deployment_readiness": report.get("deployment_readiness", "NOT_ASSESSED"),
                 "reproduction_confirmed": report.get("reproduction_confirmed"),
+                "ai_limit": str(report["ai_limit"])[:500] if report.get("ai_limit") else None,
                 "fix_review": (
                     {key: report["fix_review"].get(key) for key in ("decision", "feedback", "reviewed_by")}
                     if isinstance(report.get("fix_review"), dict)
@@ -410,8 +418,63 @@ class WorkflowManager:
             "report": final_report,
             "review": WorkflowManager._public_review(state, terminal),
             "evidence": public_summary(str(run_directory)),
+            "replay_evidence": WorkflowManager._replay_evidence(run_directory),
             "artifact_directory": str(run_directory),
         }
+
+    @staticmethod
+    def _replay_evidence(run_directory):
+        """Failure screenshots and traces saved by browser replays, oldest first."""
+        items = []
+        try:
+            entries = list(Path(run_directory).iterdir())
+        except OSError:
+            return items
+        for path in entries:
+            if not REPLAY_EVIDENCE_PATTERN.fullmatch(path.name) or path.is_symlink():
+                continue
+            try:
+                stat = path.stat()
+            except OSError:
+                continue
+            if path.is_file():
+                items.append({
+                    "name": path.name,
+                    "kind": "screenshot" if path.suffix == ".png" else "trace",
+                    "bytes": stat.st_size,
+                    "modified": stat.st_mtime,
+                })
+        items.sort(key=lambda item: (item["modified"], item["name"]))
+        return [{key: item[key] for key in ("name", "kind", "bytes")} for item in items]
+
+    def _run_directory(self, workflow_id):
+        if not isinstance(workflow_id, str) or not WORKFLOW_ID_PATTERN.fullmatch(workflow_id):
+            raise RequestError(400, "Invalid workflow ID.")
+        record = self.runs.get(workflow_id)
+        if record is not None:
+            return Path(record["run_directory"])
+        state = _read_json(self.runs_dir / workflow_id / ".control" / "state.json")
+        if state is None or state.get("workflow_id") != workflow_id:
+            raise RequestError(404, "Workflow was not found.")
+        return self.runs_dir / workflow_id
+
+    def replay_evidence_file(self, workflow_id, name):
+        """Bytes and content type of one replay screenshot or trace."""
+        if not isinstance(name, str) or not REPLAY_EVIDENCE_PATTERN.fullmatch(name):
+            raise RequestError(404, "File was not found.")
+        run_directory = self._run_directory(workflow_id)
+        path = run_directory / name
+        try:
+            if path.is_symlink() or not path.is_file():
+                raise RequestError(404, "File was not found.")
+            if path.resolve().parent != run_directory.resolve():
+                raise RequestError(404, "File was not found.")
+            if path.stat().st_size > MAX_REPLAY_EVIDENCE_BYTES:
+                raise RequestError(413, "File is too large to download from the console.")
+            content = path.read_bytes()
+        except OSError:
+            raise RequestError(404, "File was not found.") from None
+        return content, REPLAY_EVIDENCE_TYPES[path.suffix]
 
     @staticmethod
     def _public_review(state, terminal):
@@ -422,7 +485,7 @@ class WorkflowManager:
         if state.get("pause_kind") == "fix_review":
             return {
                 key: review.get(key)
-                for key in ("kind", "reason", "files", "diff", "diff_truncated", "checks")
+                for key in ("kind", "reason", "files", "diff", "diff_truncated", "checks", "scope_findings")
             }
         if state.get("pause_kind") == "manual_reproduction":
             if review.get("kind") != "recording_result":
@@ -707,6 +770,17 @@ def make_handler(manager):
             self.end_headers()
             self.wfile.write(encoded)
 
+        def _send_file(self, content, content_type, name):
+            self.send_response(200)
+            self.send_header("Content-Type", content_type)
+            self.send_header("Content-Length", str(len(content)))
+            self.send_header("Cache-Control", "no-store")
+            self.send_header("X-Content-Type-Options", "nosniff")
+            disposition = "inline" if content_type == "image/png" else "attachment"
+            self.send_header("Content-Disposition", f'{disposition}; filename="{name}"')
+            self.end_headers()
+            self.wfile.write(content)
+
         def _body(self, limit=MAX_REQUEST_BYTES):
             try:
                 length = int(self.headers.get("Content-Length", "-1"))
@@ -748,6 +822,15 @@ def make_handler(manager):
                 self._send(200, {"status": "running", "service": "workflow-control"})
                 return
             prefix = "/api/workflows/"
+            parts = path[len(prefix):].split("/") if path.startswith(prefix) else []
+            if len(parts) == 3 and parts[1] == "files":
+                try:
+                    content, content_type = manager.replay_evidence_file(parts[0], parts[2])
+                except RequestError as error:
+                    self._send(error.status_code, {"error": str(error)})
+                    return
+                self._send_file(content, content_type, parts[2])
+                return
             if path.startswith(prefix) and path.count("/") == 3:
                 try:
                     self._send(200, manager.get(path[len(prefix):]))

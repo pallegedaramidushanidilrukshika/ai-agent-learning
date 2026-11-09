@@ -350,6 +350,110 @@ def parse_workflow_arguments(argv=None):
     return arguments
 
 
+# Groq free-tier limits seen while this run's agents called the AI.
+AI_LIMIT_EVENTS = []
+PENDING_AI_LIMIT = None
+_AI_LIMIT_SIGNS = (
+    "rate_limit_exceeded", "error code: 429", "error code: 413",
+    "request too large", "tokens per day", "tokens per minute",
+)
+_AI_CONNECTION_PATTERN = re.compile(r"^\s*Connection error\.\s*$", re.MULTILINE)
+_AI_WAIT_PATTERN = re.compile(
+    r"try again in\s+(?:(\d+)h)?(?:(\d+)m(?!s))?(?:([\d.]+)s)?(?:([\d.]+)ms)?",
+    re.IGNORECASE,
+)
+
+
+def _describe_wait(seconds):
+    if seconds is None:
+        return "a few minutes"
+    if seconds < 60:
+        return "1 minute"
+    minutes = int(-(-seconds // 60))
+    if minutes < 60:
+        return f"{minutes} minutes"
+    hours, minutes = divmod(minutes, 60)
+    return f"{hours} h {minutes} min" if minutes else f"{hours} h"
+
+
+def ai_limit_from_output(text):
+    """A plain message when an agent failed on a Groq limit, else None.
+
+    Only the limit kind and wait time are taken from the provider text;
+    the message itself is fixed, so no request content or key is shown.
+    """
+    lower = (text or "").lower()
+    if not any(sign in lower for sign in _AI_LIMIT_SIGNS):
+        # The Groq SDK prints "Connection error." when it cannot reach the API.
+        # LangSmith upload warnings ("Connection error caused ...") do not count.
+        if "apiconnectionerror" in lower or _AI_CONNECTION_PATTERN.search(text or ""):
+            return {
+                "kind": "connection",
+                "wait_seconds": None,
+                "message": (
+                    "The workflow could not reach the AI service (Groq). Check the "
+                    "internet connection, then press Retry or start the run again."
+                ),
+            }
+        return None
+    wait_seconds = None
+    match = _AI_WAIT_PATTERN.search(text)
+    if match and any(match.groups()):
+        hours, minutes, secs, millis = match.groups()
+        wait_seconds = (
+            int(hours or 0) * 3600 + int(minutes or 0) * 60
+            + float(secs or 0) + float(millis or 0) / 1000
+        )
+    if "error code: 413" in lower or "request too large" in lower:
+        return {
+            "kind": "request_too_large",
+            "wait_seconds": None,
+            "message": (
+                "The request sent to the AI (Groq) was larger than the free tier "
+                "allows (HTTP 413). Waiting will not help: the prompt or the files "
+                "sent with it must be smaller."
+            ),
+        }
+    if "tokens per day" in lower or "(tpd)" in lower:
+        return {
+            "kind": "daily",
+            "wait_seconds": wait_seconds,
+            "message": (
+                "The AI (Groq) free-tier daily token limit is used up. Wait about "
+                f"{_describe_wait(wait_seconds)}, then press Retry, or stop safely "
+                "and start the run again later."
+            ),
+        }
+    return {
+        "kind": "per_minute",
+        "wait_seconds": wait_seconds,
+        "message": (
+            "The AI (Groq) per-minute token limit was hit several times in a row. "
+            f"Wait about {_describe_wait(wait_seconds)}, then press Retry."
+        ),
+    }
+
+
+def note_ai_limit(result):
+    """Remember an AI limit from a failed agent so the console can explain it."""
+    global PENDING_AI_LIMIT
+    if result.get("success"):
+        return
+    limit = ai_limit_from_output("\n".join((result.get("output") or "", result.get("error") or "")))
+    if limit is None:
+        return
+    result["ai_limit"] = limit
+    AI_LIMIT_EVENTS.append(limit)
+    PENDING_AI_LIMIT = limit
+
+
+def blocker_reason_with_ai_limit(reason):
+    """Put a pending AI limit message in front of a blocker reason, once."""
+    global PENDING_AI_LIMIT
+    limit, PENDING_AI_LIMIT = PENDING_AI_LIMIT, None
+    return f"{limit['message']} ({reason})" if limit else reason
+
+
 def run_agent(script_name, arguments=None):
     command = [
         sys.executable,
@@ -395,12 +499,14 @@ def run_agent(script_name, arguments=None):
     if stderr:
         print(stderr)
 
-    return {
+    agent_result = {
         "success": result.returncode == 0,
         "return_code": result.returncode,
         "output": stdout,
         "error": stderr,
     }
+    note_ai_limit(agent_result)
+    return agent_result
 
 
 def diagnosis_failure_reason(result, fallback):
@@ -571,10 +677,19 @@ def build_fix_diff(context):
             tofile=f"b/{relative_path}" if current is not None else "/dev/null",
         ))
         text = "".join(line if line.endswith("\n") else line + "\n" for line in diff_lines)
+        # Separate changed places, counted without context lines so that
+        # nearby edits are not merged into one hunk.
+        regions = sum(
+            1 for line in difflib.unified_diff(
+                (original or "").splitlines(), (current or "").splitlines(), n=0, lineterm="",
+            )
+            if line.startswith("@@")
+        )
         files.append({
             "file": relative_path,
             "added": sum(1 for line in diff_lines if line.startswith("+") and not line.startswith("+++")),
             "removed": sum(1 for line in diff_lines if line.startswith("-") and not line.startswith("---")),
+            "regions": regions,
         })
         if total + len(text) > MAX_REVIEW_DIFF_CHARS:
             truncated = True
@@ -582,6 +697,41 @@ def build_fix_diff(context):
         total += len(text)
         chunks.append(text)
     return {"files": files, "diff": "".join(chunks), "diff_truncated": truncated}
+
+
+FIX_SCOPE_MAX_REGIONS = 3
+FIX_SCOPE_MAX_CHANGED_LINES = 60
+
+
+def _repository_relative(path):
+    return str(path).replace("\\", "/").removeprefix("./").strip("/")
+
+
+def fix_scope_findings(fix_diff, affected_files):
+    """Reasons a fix may change more than the reported bug needs (empty when it looks focused)."""
+    if isinstance(affected_files, str):
+        affected_files = [affected_files]
+    expected = {_repository_relative(name) for name in affected_files or [] if isinstance(name, str)}
+    files = fix_diff.get("files") or []
+    findings = []
+
+    outside = [entry["file"] for entry in files if expected and _repository_relative(entry["file"]) not in expected]
+    if outside:
+        findings.append(
+            f"The fix changed files the diagnosis did not name: {', '.join(outside)}."
+        )
+    regions = sum(int(entry.get("regions") or 0) for entry in files)
+    if regions > FIX_SCOPE_MAX_REGIONS:
+        findings.append(
+            f"The fix changed {regions} separate places in the code (more than "
+            f"{FIX_SCOPE_MAX_REGIONS}), so it may also change code unrelated to the bug."
+        )
+    changed_lines = sum(int(entry.get("added") or 0) + int(entry.get("removed") or 0) for entry in files)
+    if changed_lines > FIX_SCOPE_MAX_CHANGED_LINES:
+        findings.append(
+            f"The fix changed {changed_lines} lines (more than {FIX_SCOPE_MAX_CHANGED_LINES})."
+        )
+    return findings
 
 
 def prompt_fix_review(fix_review):
@@ -592,8 +742,10 @@ def prompt_fix_review(fix_review):
         interactive = False
     if not interactive:
         return None
-    print_header("FIX REVIEW: THE BUG WAS NOT CONFIRMED BY A TEST")
+    print_header(fix_review.get("title") or "FIX REVIEW")
     print(fix_review["reason"])
+    for finding in fix_review.get("scope_findings") or []:
+        print(f"- {finding}")
     print(fix_review["diff"] or "(No file changes were recorded.)")
     try:
         answer = input("Approve this fix? [a]pprove / [r]eject: ").strip().lower()
@@ -607,16 +759,35 @@ def prompt_fix_review(fix_review):
     return None
 
 
-def review_unconfirmed_fix(context, checks):
-    """A fix for a bug that no automated test confirmed needs a human decision."""
-    fix_review = build_fix_diff(context)
-    fix_review.update({
-        "reason": (
-            "The bug was reproduced only from user-reported steps, not by an "
-            "automated test, so passing tests do not prove the reported bug is fixed."
-        ),
-        "checks": checks,
-    })
+def review_unconfirmed_fix(context, checks, scope_findings=None, fix_diff=None):
+    """Ask a human to approve a fix that checks alone cannot prove.
+
+    Used when the bug was never confirmed by an automated test, or when a fix
+    for a confirmed bug looks wider than the bug needs (scope_findings).
+    """
+    fix_review = dict(fix_diff) if fix_diff is not None else build_fix_diff(context)
+    if scope_findings:
+        fix_review.update({
+            "title": "FIX REVIEW: THE FIX MAY CHANGE MORE THAN THE BUG NEEDS",
+            "reason": (
+                "The bug was confirmed and all checks passed, but the fix looks wider "
+                "than the reported bug needs. Check that every change is needed."
+            ),
+            "message": (
+                "Checks passed, but the fix may change more than the bug needs. "
+                "Review the changes, then approve or reject."
+            ),
+            "scope_findings": list(scope_findings),
+        })
+    else:
+        fix_review.update({
+            "title": "FIX REVIEW: THE BUG WAS NOT CONFIRMED BY A TEST",
+            "reason": (
+                "The bug was reproduced only from user-reported steps, not by an "
+                "automated test, so passing tests do not prove the reported bug is fixed."
+            ),
+        })
+    fix_review["checks"] = checks
     if control_enabled():
         decision = wait_for_fix_review(fix_review)
     else:
@@ -1152,14 +1323,20 @@ def confirmed_reproduction_file(source):
 def run_browser_replay(recording_path, name):
     """Start the app, replay the recording's steps, stop the app."""
     output_path = run_artifact_path(f"{name}.json")
-    if os.path.exists(output_path):
-        os.remove(output_path)
+    screenshot_path = run_artifact_path(f"{name}_failure.png")
+    trace_path = run_artifact_path(f"{name}_trace.zip")
+    # Remove files from an earlier replay with the same name, so the console
+    # never shows evidence from a different recording.
+    for path in (output_path, screenshot_path, trace_path):
+        if os.path.exists(path):
+            os.remove(path)
     run_agent(
         AGENTS["browser_replay"],
         [
             "--recording", recording_path,
             "--output", output_path,
-            "--screenshot", run_artifact_path(f"{name}_failure.png"),
+            "--screenshot", screenshot_path,
+            "--trace", trace_path,
         ],
     )
     result = load_json(output_path)
@@ -1744,6 +1921,12 @@ def add_stage_result(
         "status": status,
         "timestamp": datetime.now().isoformat(),
     }
+
+    # Only the first failed stage after the limit was hit gets the message.
+    if status == "FAILED" and PENDING_AI_LIMIT is not None and not PENDING_AI_LIMIT.get("stage_noted"):
+        PENDING_AI_LIMIT["stage_noted"] = True
+        details = dict(details or {})
+        details["ai_limit"] = PENDING_AI_LIMIT["message"]
 
     if details is not None:
         item["details"] = details
@@ -3060,7 +3243,9 @@ def _run_workflow():
         if control_enabled() and attempt < MAX_RETRIES + 1:
             action = wait_for_blocker_action(
                 "Fix Verification",
-                "Test, build, runtime, or fix verification did not pass.",
+                blocker_reason_with_ai_limit(
+                    "Test, build, runtime, or fix verification did not pass."
+                ),
                 MAX_RETRIES,
                 allowed_actions=["retry", "stop_safely"],
             )
@@ -3114,25 +3299,39 @@ def _run_workflow():
 
     # A bug that was never confirmed by an automated test (user-reported
     # steps only) is not proven fixed by passing tests: a human must approve.
+    # A fix for a confirmed bug that looks wider than the bug needs (files the
+    # diagnosis did not name, many separate changes) also needs approval.
     fix_review = None
     reproduction_confirmed = reproduction_source in CONFIRMED_SOURCES
-    if final_status == "PASS" and reproduction_source == "manual":
+    review_context = context if isinstance(context, dict) else {}
+    scope_findings, fix_diff = [], None
+    if final_status == "PASS" and reproduction_source != "manual":
+        fix_diff = build_fix_diff(review_context)
+        diagnosis_for_scope = load_json(DIAGNOSIS_FILE)
+        scope_findings = fix_scope_findings(
+            fix_diff,
+            diagnosis_for_scope.get("affected_files", []) if isinstance(diagnosis_for_scope, dict) else [],
+        )
+    if final_status == "PASS" and (reproduction_source == "manual" or scope_findings):
         print_stage(8, "Human Fix Review")
         fix_review = review_unconfirmed_fix(
-            context if isinstance(context, dict) else {},
+            review_context,
             {
                 "tests": "PASS" if tests_passed else "FAIL",
                 "build": "PASS" if builds_passed else "FAIL",
                 "runtime_validation": "PASS" if runtime_passed else "FAIL",
                 "verification": "PASS" if verification_passed else "FAIL",
             },
+            scope_findings=scope_findings,
+            fix_diff=fix_diff,
         )
         if fix_review["decision"] == "approve":
             review_status, final_status = "SUCCESS", "PASS"
         elif fix_review["decision"] == "reject":
             review_status, final_status = "FAILED", "FAIL"
         else:
-            review_status, final_status = "SKIPPED", "UNCONFIRMED"
+            review_status = "SKIPPED"
+            final_status = "NEEDS_REVIEW" if scope_findings else "UNCONFIRMED"
         add_stage_result(
             stage_results,
             8,
@@ -3140,7 +3339,7 @@ def _run_workflow():
             review_status,
             {
                 key: fix_review.get(key)
-                for key in ("decision", "feedback", "reviewed_by", "files", "diff_truncated")
+                for key in ("decision", "feedback", "reviewed_by", "files", "diff_truncated", "scope_findings")
             },
         )
 
@@ -3175,10 +3374,12 @@ def _run_workflow():
         reproduction_source,
     )
     report["reproduction_confirmed"] = reproduction_confirmed
+    if AI_LIMIT_EVENTS:
+        report["ai_limit"] = AI_LIMIT_EVENTS[-1]["message"]
     if fix_review is not None:
         report["fix_review"] = {
             key: fix_review.get(key)
-            for key in ("decision", "feedback", "reviewed_by", "files", "diff_truncated", "checks")
+            for key in ("decision", "feedback", "reviewed_by", "files", "diff_truncated", "checks", "scope_findings")
         }
         report["fix_review"]["artifact_ref"] = os.path.relpath(
             FIX_REVIEW_FILE, ACTIVE_RUN_ARTIFACT_DIR or BASE_DIR

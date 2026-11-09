@@ -486,8 +486,9 @@ def wait_for_fix_review(fix_review, timeout=CONTROL_WAIT_SECONDS):
         "diff": str(fix_review.get("diff", ""))[:MAX_FIX_DIFF_LENGTH],
         "diff_truncated": bool(fix_review.get("diff_truncated")),
         "checks": fix_review.get("checks", {}),
+        "scope_findings": [str(item)[:500] for item in (fix_review.get("scope_findings") or [])[:10]],
     }
-    message = (
+    message = fix_review.get("message") or (
         "The bug was never confirmed by an automated test, so the fix needs your "
         "approval. Review the changes and test results, then approve or reject."
     )

@@ -129,7 +129,7 @@ The workflow continues only when the reported failure can be reproduced. When au
    npx playwright codegen http://localhost:3000
    ```
 
-   Use the codegen toolbar to add an assertion for what the correct app should show (for example "the empty task is not in the list"). Save the script (`.js`, `.ts` or `.py`).
+   Reproduce the bug in the browser, then add by hand an assertion for what the correct app should show (for example `await expect(page.locator('input[name="check"]')).toHaveCount(2);`, see the note below on toolbar assertions). Save the script (`.js`, `.ts` or `.py`).
 2. Stop your own copy of the app, then upload the script in the console's **Upload a Playwright recording** panel.
 3. The workflow turns the script into a step list. **The uploaded script is never run.** Only these parts are kept:
    * `goto` to `localhost` / `127.0.0.1`, one app only
@@ -143,6 +143,7 @@ The workflow continues only when the reported failure can be reproduced. When au
    * **Everything passes**: the recording does not show the bug, and the user can upload another one or type steps.
    * A **step cannot run** (element not found, app did not start): it is reported as an error, not as a reproduction.
 5. After each fix attempt the same steps are replayed on the fixed app, and every step must pass. Otherwise the attempt fails and is retried.
+6. Every replay saves a Playwright trace (`browser_replay_<name>_trace.zip`) and, when it stops at a failing step, a screenshot (`browser_replay_<name>_failure.png`) in the run folder. The console shows the screenshots and links to download the traces under **Browser replay evidence**. Open a trace with `npx playwright show-trace <file>` in `browser_replay/` to see each step with the page before and after it. The API serves only these replay files from the run folder, nothing else.
 
 The replay needs Playwright and Chromium, installed once in `browser_replay/`:
 
@@ -171,6 +172,15 @@ npx playwright codegen --output <recording.spec.ts> <printed URL>
 ```
 
 Codegen's toolbar assertions record what the page shows **now**, which on the buggy app is the wrong behaviour. Add the expected-behaviour assertion by hand, for example `await expect(page.locator('tbody tr')).toHaveCount(1);`. When the list loads after navigation, first wait for something that must be there (for example `await expect(page.getByText('Alice')).toBeVisible();`) so a count is not checked before the data arrives.
+
+**Resetting a demo copy between runs.** A run leaves the AI fix and the generated test in the project copy. To run the same demo again, put the copy back to its committed (buggy) state. The script shows what it would change; add `--yes` to apply it. It keeps commits, `node_modules` and `.env` / `config.env` files, and refuses to touch this workflow project:
+
+```powershell
+.\venv\Scripts\python.exe reset_demo_copy.py <path-to-demo-copy> [<another-copy> ...]
+.\venv\Scripts\python.exe reset_demo_copy.py <path-to-demo-copy> --yes
+```
+
+Use it only on copies made for demos, never on a repository with your own unsaved work.
 
 Either way, the human can attach evidence files instead of describing the bug in text: HAR recordings, JSON message logs, `.log`/`.txt` files and recorded test scripts (max 5 files, 256 KB each, 1 MB total). Files are read as text and never executed. Tokens, cookies, keys and passwords are redacted before the AI sees them.
 
@@ -398,8 +408,18 @@ ai-agent-learning/
 ├── test_result_checker.py
 ├── verification_agent.py
 ├── workflow_orchestrator.py
+├── workflow_ui_api.py            (local API for the web console)
+├── workflow_control.py           (Retry / Continue / Stop Safely, human input)
+├── workflow_validation.py        (bounded commands, test output parsing)
+├── browser_recording.py          (Playwright recording parser)
+├── browser_replay_agent.py       (starts the app and replays a recording)
+├── browser_replay/replay.mjs     (fixed Playwright replay runner)
+├── reset_demo_copy.py            (puts a demo copy back to its buggy state)
+├── level3-serverless-app/frontend/src/WorkflowConsole.tsx (web console)
+├── tests/                        (offline regression tests)
 │
-├── repository_context.json
+├── workflow_runs/<run-id>/       (artifacts of each console run)
+├── repository_context.json       (terminal-mode artifacts below)
 ├── reproduction_result.json
 ├── diagnosis.json
 ├── test_result.json
@@ -617,6 +637,7 @@ Final statuses:
 | `PASS` | Fix verified. If the bug was confirmed only by manual steps, a human also approved the fix. |
 | `FAIL` | Validation failed, retries ran out, or a human rejected the fix |
 | `UNCONFIRMED` | Every check passed, but nobody confirmed the bug with a test or reviewed the fix |
+| `NEEDS_REVIEW` | Every check passed, but the fix looks wider than the bug needs and nobody approved it |
 | `STOPPED` | A human chose Stop Safely. No new stage starts and all artifacts are kept. |
 
 ---
@@ -755,9 +776,12 @@ Enforced checks:
 * AI reproduction test with human confirmation (fail before fix, pass after fix): Implemented
 * Evidence upload (HAR, logs, recorded scripts) with secret redaction: Implemented
 * Human fix review for bugs not confirmed by a test (`UNCONFIRMED` status): Implemented
+* AI limit messages: when an agent fails on the Groq free-tier limit (daily tokens, per-minute tokens or HTTP 413 request too large) or cannot reach Groq at all (connection error), the console and report say what happened and how long to wait, without showing the provider's raw error: Implemented
+* Fix scope check: a fix for a confirmed bug that changes files the diagnosis did not name, more than 3 separate places or more than 60 lines also needs human approval (`NEEDS_REVIEW` when not approved): Implemented
 * Playwright recording replay for full-stack apps (temporary MongoDB, backend and Vite frontend) and record mode: Implemented. Full console run on the Level 2 MERN app ended in `PASS` on the first attempt, with the user's own database untouched.
 * Playwright codegen recording as reproduction (safe step list, replay before and after the fix): Implemented and verified. Full console run on the Level 1 Todo app with a recording made in `playwright codegen` ended in `PASS` on the first attempt: the recording failed before the fix (3 tasks instead of 2) and passed after it.
-* Full real-AI (Groq) run of the new flow ending in `PASS`: Not yet verified. The rehearsal produced a correct fix but ended `FAIL` because of the Groq free-tier token limit and a fallback-test bug, both since fixed.
+* Full real-AI (Groq) runs of the new flow: Verified. Level 1 and Level 2 console runs with Groq diagnosis, fix and test generation ended in `PASS` on the first attempt, and a later Level 1 regression run passed again after the reliability fixes.
+* Playwright recording replay for Level 3: Not supported (frontend uses the AWS WebSocket API). Planned as future work; Level 3 uses the AI reproduction test.
 * AWS deployment: Not done. Waiting for supervisor approval.
 
 ### AI / LLM Learning
@@ -791,6 +815,7 @@ Possible future improvements include:
 * AI reproduction tests for stacks other than Jest and pytest
 * More advanced retry and recovery strategies
 * Full external workflow automation using n8n
+* Playwright recording replay for Level 3, using a local stand-in for the AWS WebSocket API so no AWS resource is used
 
 ## Supervisor Demo and Verified Support
 

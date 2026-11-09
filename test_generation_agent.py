@@ -126,6 +126,32 @@ ESM_TEST_RULE = """
     """
 
 
+MAX_TOOL_CALL_ATTEMPTS = 3
+SHORTER_TEST_REMINDER = """
+
+    Your previous create_test_file call was malformed and rejected.
+    Write a shorter test file this time (under 40 lines, no comments)
+    and make sure the content is one valid JSON string.
+    """
+
+
+EDGE_CASE_RULES = """
+
+    EDGE CASES (in the same test file):
+
+    - Besides the reported case, check the closest variants of
+      the same input that the bug implies. For empty or missing
+      input, also check whitespace-only input ("   ") and that a
+      normal valid value still works.
+    - Do not test unrelated features or invent requirements.
+    - Keep the whole file short (about 40 lines): no comments,
+      at most one small helper. Long tool calls often fail.
+    - If an edge-case check fails because the application still
+      mishandles it, keep the check: it shows the fix is
+      incomplete. Only correct checks that are wrong themselves.
+    """
+
+
 def app_start_problems(content):
     """Reasons a generated test would start or import the app itself."""
     problems = [message for pattern, message in APP_START_PATTERNS if pattern.search(content)]
@@ -1483,7 +1509,7 @@ def main():
 
     25. Finish only after the generated test file exists
         and the configured test command has been executed.
-    """ + (APP_RUN_RULES if workflow_runs_app else "") + (
+    """ + EDGE_CASE_RULES + (APP_RUN_RULES if workflow_runs_app else "") + (
         ESM_TEST_RULE
         if workflow_runs_app and node_test_for_backend and backend_package().get("type") == "module"
         else ""
@@ -1680,16 +1706,18 @@ def main():
             system_prompt=system_prompt,
         )
 
-        # The provider occasionally rejects a malformed tool call
-        # ("tool_use_failed"). Ask once more before using the fallback.
-        for generation_attempt in (1, 2):
+        # The provider sometimes rejects a malformed tool call
+        # ("tool_use_failed"), more often for long test files. Ask again
+        # for a shorter file before using the fallback.
+        attempt_message = message
+        for generation_attempt in range(1, MAX_TOOL_CALL_ATTEMPTS + 1):
             try:
                 result = agent.invoke(
                     {
                         "messages": [
                             {
                                 "role": "user",
-                                "content": message,
+                                "content": attempt_message,
                             }
                         ]
                     }
@@ -1697,14 +1725,15 @@ def main():
                 break
             except Exception as generation_error:
                 if (
-                    generation_attempt == 2
+                    generation_attempt == MAX_TOOL_CALL_ATTEMPTS
                     or "tool_use_failed" not in str(generation_error)
                 ):
                     raise
                 print(
-                    "\nThe model returned a malformed tool call; "
-                    "retrying test generation once."
+                    "\nThe model returned a malformed tool call; retrying test "
+                    f"generation ({generation_attempt + 1}/{MAX_TOOL_CALL_ATTEMPTS})."
                 )
+                attempt_message = message + SHORTER_TEST_REMINDER
 
 
     except Exception as error:

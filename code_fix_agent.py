@@ -341,6 +341,14 @@ IMPORTANT:
 - Make the minimum necessary changes.
 - Preserve existing functionality.
 - Do not modify unrelated files.
+- Change only the function, route or handler that causes the
+  reported bug. Do not rewrite, reorder or improve other functions
+  or routes, even in the same file and even if they look wrong;
+  mention such problems in your final summary instead. Fixes that
+  change many separate places are sent to a human for review.
+- When the bug is about empty or missing input, also reject
+  whitespace-only input (for example "   "), and keep valid
+  input working.
 
 IMPORTANT DIAGNOSIS RULE:
 

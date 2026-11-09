@@ -74,3 +74,26 @@ def test_rules_tell_the_model_the_app_is_already_running():
     rules = helpers["APP_RUN_RULES"]
     assert "process.env.REPRODUCTION_BASE_URL" in rules
     assert "Do NOT start, spawn" in rules
+
+
+def test_edge_case_rules_ask_for_whitespace_and_valid_input():
+    rules = helpers["EDGE_CASE_RULES"]
+    assert 'whitespace-only input ("   ")' in rules
+    assert "normal valid value still works" in rules
+    assert "keep the check" in rules
+
+
+def test_edge_case_rules_are_always_in_the_system_prompt():
+    source = (Path(__file__).resolve().parents[1] / "test_generation_agent.py").read_text(encoding="utf-8")
+    assert '""" + EDGE_CASE_RULES + (APP_RUN_RULES if workflow_runs_app else "")' in source
+
+
+def test_code_fix_prompt_treats_whitespace_as_empty():
+    source = (Path(__file__).resolve().parents[1] / "code_fix_agent.py").read_text(encoding="utf-8")
+    assert "also reject\n  whitespace-only input" in source
+
+
+def test_rules_ask_for_a_short_test_file():
+    assert "about 40 lines" in helpers["EDGE_CASE_RULES"]
+    assert helpers["MAX_TOOL_CALL_ATTEMPTS"] == 3
+    assert "shorter test file" in helpers["SHORTER_TEST_REMINDER"]

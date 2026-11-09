@@ -351,6 +351,7 @@
 .fix-files { margin: 0; padding: 0; list-style: none; display: flex; flex-direction: column; gap: 2px; font: 11px/1.4 Consolas, "Courier New", monospace; }
 .fix-files li { display: flex; flex-wrap: wrap; gap: 8px; overflow-wrap: anywhere; }
 .fix-files small { color: var(--muted); }
+.scope-findings { margin: 0; padding-left: 18px; font-size: 12px; color: var(--oxide); display: flex; flex-direction: column; gap: 2px; }
 
 /* AI reproduction test review */
 .review-panel { display: flex; flex-direction: column; gap: 8px; min-width: 0; }
@@ -429,3 +430,9 @@
   .workflow-footer { padding-inline: 16px; flex-direction: column; }
   .demo-panel { margin: 25px auto; padding: 20px 16px; }
 }
+.replay-evidence { display: flex; flex-direction: column; gap: 8px; margin: 18px 0; }
+.replay-evidence figure { margin: 0; display: flex; flex-direction: column; gap: 4px; }
+.replay-evidence img { max-width: 100%; height: auto; border: 1px solid var(--line, #d0d0d0); }
+.replay-evidence figcaption { font-size: 11px; color: var(--muted); }
+.replay-evidence ul { margin: 0; padding: 0; list-style: none; display: flex; flex-direction: column; gap: 4px; font-size: 12px; }
+.replay-evidence small { color: var(--muted); }
