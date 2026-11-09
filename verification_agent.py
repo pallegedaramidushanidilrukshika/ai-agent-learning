@@ -1,14 +1,29 @@
 import json
 import os
+import sys
+
+from workflow_artifacts import resolve_artifact_path
+from workflow_validation import (
+    build_result_has_success_evidence,
+    runtime_result_has_success_evidence,
+    test_result_has_success_evidence,
+)
+
+
+if hasattr(sys.stdout, "reconfigure"):
+    sys.stdout.reconfigure(
+        encoding="utf-8",
+        errors="replace",
+    )
 
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
-CONTEXT_PATH = os.path.join(BASE_DIR, "repository_context.json")
-TEST_RESULT_PATH = os.path.join(BASE_DIR, "test_result.json")
-BUILD_RESULT_PATH = os.path.join(BASE_DIR, "build_result.json")
-VALIDATION_RESULT_PATH = os.path.join(BASE_DIR, "validation_result.json")
-DIAGNOSIS_PATH = os.path.join(BASE_DIR, "diagnosis.json")
-REPORT_PATH = os.path.join(BASE_DIR, "verification_report.json")
+CONTEXT_PATH = resolve_artifact_path("repository_context.json", BASE_DIR)
+TEST_RESULT_PATH = resolve_artifact_path("test_result.json", BASE_DIR)
+BUILD_RESULT_PATH = resolve_artifact_path("build_result.json", BASE_DIR)
+VALIDATION_RESULT_PATH = resolve_artifact_path("validation_result.json", BASE_DIR)
+DIAGNOSIS_PATH = resolve_artifact_path("diagnosis.json", BASE_DIR)
+REPORT_PATH = resolve_artifact_path("verification_report.json", BASE_DIR)
 
 
 def load_json(path):
@@ -74,41 +89,32 @@ test_command = strategy.get("test_command")
 build_command = strategy.get("build_command")
 validation_method = strategy.get("validation_method")
 test_framework = strategy.get("test_framework")
+architecture = repository_context.get("architecture", {})
+components = architecture.get("components", []) if isinstance(architecture, dict) else []
+component_builds = [
+    component for component in components
+    if isinstance(component, dict) and component.get("build_command")
+]
+test_generation = load_json(
+    resolve_artifact_path("test_generation_result.json", BASE_DIR)
+) or {}
 
 reasons = []
 build_result = {}
 validation_result = {}
 
-# Verify test execution generically.
-return_code = test_result.get("return_code")
-tests = test_result.get("tests")
-passed = test_result.get("passed")
-failed = test_result.get("failed")
+test_was_configured_or_generated = bool(test_command) or bool(
+    test_generation.get("test_file")
+)
 
-if return_code != 0:
-    reasons.append("The test command returned a non-zero exit code.")
+if test_was_configured_or_generated:
+    if not test_result_has_success_evidence(test_result):
+        reasons.append(
+            "Test result is missing a successful exit code or consistent passing test counts."
+        )
 
-if not isinstance(tests, int) or tests <= 0:
-    reasons.append("No executed test count was reported.")
-
-if not isinstance(passed, int):
-    reasons.append("The number of passed tests was not reported.")
-
-if not isinstance(failed, int):
-    reasons.append("The number of failed tests was not reported.")
-
-if (
-    isinstance(tests, int)
-    and isinstance(passed, int)
-    and passed != tests
-):
-    reasons.append("Not all executed tests passed.")
-
-if isinstance(failed, int) and failed != 0:
-    reasons.append("One or more test failures were reported.")
-
-# If a build strategy exists, use an available build result.
-if build_command:
+# Run and verify builds detected on individual application components.
+if component_builds or build_command:
     build_result = load_json(BUILD_RESULT_PATH)
 
     if not isinstance(build_result, dict):
@@ -119,30 +125,28 @@ if build_command:
         if build_result.get("return_code") != 0:
             reasons.append("The build command returned a non-zero exit code.")
 
-        if build_result.get("status") not in (None, "PASSED", "PASS", "SUCCESS"):
+        if build_result.get("status") not in ("PASSED", "PASS", "SUCCESS"):
             reasons.append("The build result does not indicate success.")
 
-# Use an available validation result without assuming a specific method.
-if validation_method:
-    validation_result = load_json(VALIDATION_RESULT_PATH)
+        expected_builds = len(component_builds) if component_builds else 1
+        if not build_result_has_success_evidence(build_result, expected_builds):
+            reasons.append("Build result is missing successful component evidence.")
 
-    if validation_result is not None:
-        if not isinstance(validation_result, dict):
-            reasons.append("validation_result.json is invalid.")
-        elif validation_result.get("status") not in (
-            "PASSED",
-            "PASS",
-            "SUCCESS",
-            "FIXED"
-        ):
-            reasons.append(
-                "The configured validation result does not indicate success."
-            )
+validation_result = load_json(VALIDATION_RESULT_PATH)
+
+if validation_result is not None:
+    if not isinstance(validation_result, dict):
+        reasons.append("validation_result.json is invalid.")
+    elif not runtime_result_has_success_evidence(validation_result):
+        reasons.append("Runtime validation is missing structured success evidence.")
+elif validation_method and "http" in str(validation_method).lower():
+    reasons.append("HTTP runtime validation result is missing.")
 
 status = "PASS" if not reasons else "FAIL"
 
 report = {
     "status": status,
+    "return_code": 0 if status == "PASS" else 1,
     "reason": reasons or [
         "Verification succeeded: the configured test execution completed successfully."
     ],
@@ -155,7 +159,7 @@ report = {
     "test_result": test_result,
     "build_result": build_result,
     "validation_result": validation_result,
-    "diagnosis": diagnosis
+    "diagnosis": diagnosis,
 }
 
 save_report(report)

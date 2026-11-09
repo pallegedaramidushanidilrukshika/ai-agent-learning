@@ -1,0 +1,12 @@
+{
+  "name": "browser-replay",
+  "private": true,
+  "description": "Replays validated Playwright codegen steps for the bug-fixing workflow.",
+  "type": "module",
+  "scripts": {
+    "codegen": "playwright codegen"
+  },
+  "dependencies": {
+    "playwright": "1.55.1"
+  }
+}

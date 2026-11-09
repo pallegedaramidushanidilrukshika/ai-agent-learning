@@ -1,7 +1,7 @@
 {
-  "bug_title": "Selected task cannot be removed or moved to Completed Tasks",
-  "description": "When a user selects a task from the Added Tasks list and clicks the Remove button, the selected task should be removed from Added Tasks and moved to Completed Tasks. In the buggy version, the task is not correctly submitted to the /removetask endpoint because the Remove controls are associated with the wrong form.",
-  "expected_behavior": "Selecting a task and clicking Remove should send a POST request to /removetask, remove the selected task from Added Tasks, and add it to Completed Tasks.",
-  "actual_behavior": "The selected task cannot be correctly removed and moved to Completed Tasks in the buggy version.",
+  "bug_title": "Empty task can be added",
+  "description": "Submitting the Add Task form with an empty or whitespace-only value creates an empty task in the Added Task list.",
+  "expected_behavior": "Empty or whitespace-only tasks must be rejected.",
+  "actual_behavior": "An empty task appears in the Added Task section.",
   "severity": "High"
 }

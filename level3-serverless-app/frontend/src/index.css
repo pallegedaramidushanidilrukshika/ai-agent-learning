@@ -1,0 +1,64 @@
+:root {
+  font-family: 'Aptos', 'Segoe UI', sans-serif;
+  color: #18352f;
+  background: #f3f7f4;
+  font-synthesis: none;
+  text-rendering: optimizeLegibility;
+  -webkit-font-smoothing: antialiased;
+  -moz-osx-font-smoothing: grayscale;
+}
+
+* { box-sizing: border-box; }
+
+body {
+  min-width: 320px;
+  min-height: 100vh;
+  margin: 0;
+}
+
+button, input, textarea { font: inherit; }
+
+#root {
+  min-height: 100vh;
+}
+
+/* Keep the original WebSocket demo readable under the shared global reset. */
+.app {
+  width: min(100%, 720px);
+  min-height: 100vh;
+  margin: 0 auto;
+  padding: 48px 24px;
+  color: #18352f;
+  text-align: left;
+  background: #fff;
+  border-inline: 1px solid #d9e2dd;
+}
+
+.app h1 {
+  margin: 0 0 24px;
+  color: #18352f;
+  font: 600 32px/1.2 'Iowan Old Style', 'Palatino Linotype', Georgia, serif;
+  letter-spacing: 0;
+}
+
+.app input {
+  min-height: 42px;
+  padding: 9px 11px;
+  color: #18352f;
+  background: #fbfdfb;
+  border: 1px solid #cbd7d0;
+  border-radius: 2px;
+}
+
+.app button {
+  min-height: 40px;
+  padding: 0 14px;
+  color: #fff;
+  background: #225b4c;
+  border: 0;
+  border-radius: 2px;
+  cursor: pointer;
+}
+
+.app button:disabled { opacity: 0.5; cursor: not-allowed; }
+.app [role='alert'] { color: #963d2c; }

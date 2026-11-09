@@ -3,18 +3,35 @@ venv/
 
 # Environment / secrets
 .env
+.env.*
+!.env.example
 
 # Python cache
 __pycache__/
 *.pyc
 .pytest_cache/
 
-# Runtime / generated workflow artifacts
+# Runtime workflow artifacts (terminal mode writes them to the project root;
+# the web console keeps each run under workflow_runs/)
+build_result.json
+code_fix_originals.json
+code_fix_result.json
+confirmed_reproduction_test.json
 diagnosis.json
+fix_baseline.json
+fix_review.json
+manual_reproduction.json
+repository_context.json
+reproduction_result.json
+reproduction_test.json
+reproduction_test_feedback.json
+test_generation_result.json
 test_result.json
+validation_result.json
 verification_report.json
 workflow_report.json
-reproduction_result.json
+workflow_artifact_archive/
+workflow_runs/
 
 # Retry / archived runtime artifacts
 bug_report_retry_*.json
@@ -24,3 +41,10 @@ diagnosis_retry_*.json
 # Local backups
 *.fixed-backup
 test_generation_agent.py.backup
+
+# Node dependencies and build output
+level3-serverless-app/node_modules/
+level3-serverless-app/**/node_modules/
+level3-serverless-app/backend/.serverless/
+level3-serverless-app/frontend/dist/
+browser_replay/node_modules/
