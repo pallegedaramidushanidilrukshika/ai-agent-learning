@@ -125,7 +125,7 @@ The workflow continues only when the reported failure can be reproduced. When au
 1. Record the bug against the local app:
 
    ```powershell
-   cd C:\Users\SINGER\OneDrive\Desktop\ai-agent-learning\browser_replay
+   cd <project-folder>\browser_replay
    npx playwright codegen http://localhost:3000
    ```
 
@@ -148,7 +148,7 @@ The workflow continues only when the reported failure can be reproduced. When au
 The replay needs Playwright and Chromium, installed once in `browser_replay/`:
 
 ```powershell
-cd C:\Users\SINGER\OneDrive\Desktop\ai-agent-learning\browser_replay
+cd <project-folder>\browser_replay
 npm install
 npx playwright install chromium
 ```
@@ -164,7 +164,7 @@ Without them the console reports "Playwright is not installed" and typed steps s
 **Record mode for full-stack apps.** Recording against your own running copy would write test data into your real database. Instead start the app isolated, record against the URL it prints, then press Enter to stop it:
 
 ```powershell
-cd C:\Users\SINGER\OneDrive\Desktop\ai-agent-learning
+cd <project-folder>
 .\venv\Scripts\python.exe browser_replay_agent.py --serve <path-to-repository>
 # in another terminal:
 cd browser_replay
@@ -415,6 +415,7 @@ ai-agent-learning/
 ├── browser_replay_agent.py       (starts the app and replays a recording)
 ├── browser_replay/replay.mjs     (fixed Playwright replay runner)
 ├── reset_demo_copy.py            (puts a demo copy back to its buggy state)
+├── demo_recordings/              (Playwright recordings for the Level 1 and Level 2 demos)
 ├── level3-serverless-app/frontend/src/WorkflowConsole.tsx (web console)
 ├── tests/                        (offline regression tests)
 │
@@ -573,6 +574,99 @@ pip install -r requirements.txt
 
 Create a `.env` file using `.env.example` as a reference and configure the required API credentials.
 
+### Run it on another computer (quick start)
+
+These steps set up the web console and the two verified demos (Level 1 Todo and Level 2 MERN) on a new Windows machine. In the commands, `<parent-folder>` is any folder you choose, for example `C:\work\ai-workflow-demo`.
+
+**1. Install the tools**
+
+* Git, Python 3.12 or newer, Node.js 20 or newer
+* MongoDB Community Server (only for the Level 2 demo). It does not need to be running: the workflow starts its own temporary database. It is found on `PATH` or in `C:\Program Files\MongoDB\Server\<version>\bin`.
+* A Groq API key (free tier). One full run uses a large share of the free daily token limit, so plan for about 2–3 runs per day.
+
+**2. Clone the workflow and the two demo projects into one parent folder**
+
+```powershell
+cd <parent-folder>
+git clone -b supervisor-ready-workflow https://github.com/pallegedaramidushanidilrukshika/ai-agent-learning.git
+mkdir target-projects
+git clone https://github.com/pallegedaramidushanidilrukshika/ai-bug-fixing-agent-demo.git target-projects\ai-bug-fixing-agent-demo
+git clone https://github.com/mongodb-developer/mern-stack-example.git target-projects\mern-stack-example
+git -C target-projects\mern-stack-example checkout 6a5e939
+```
+
+The MERN example is pinned to the commit the demo was verified on.
+
+**3. Install the Python and Node.js dependencies**
+
+```powershell
+cd <parent-folder>\ai-agent-learning
+python -m venv venv
+.\venv\Scripts\python.exe -m pip install -r requirements.txt
+cd browser_replay; npm install; npx playwright install chromium; cd ..
+cd level3-serverless-app\frontend; npm install; cd ..\..
+cd ..\target-projects\ai-bug-fixing-agent-demo; npm install
+cd ..\mern-stack-example\mern\server; npm install
+cd ..\client; npm install
+cd ..\server; copy config.env.example config.env
+```
+
+The MERN backend starts with `node --env-file=config.env`, so the file must exist. The copied example is enough: during a run the workflow points `ATLAS_URI` at its own temporary database.
+
+**4. Add your Groq key**
+
+Copy `.env.example` to `.env` in `ai-agent-learning`, set `GROQ_API_KEY`, and set `LANGSMITH_TRACING=false` unless you use LangSmith. Never commit `.env`.
+
+**5. Check the installation (optional, no AI calls)**
+
+```powershell
+cd <parent-folder>\ai-agent-learning
+.\venv\Scripts\python.exe -m pytest tests -q
+```
+
+**6. Start the console (two terminals, keep both open)**
+
+Terminal 1, the workflow API:
+
+```powershell
+cd <parent-folder>\ai-agent-learning
+$env:WORKFLOW_ALLOWED_REPOSITORY_ROOTS = "<parent-folder>\target-projects"
+.\venv\Scripts\python.exe workflow_ui_api.py
+```
+
+Terminal 2, the console:
+
+```powershell
+cd <parent-folder>\ai-agent-learning\level3-serverless-app\frontend
+npm run dev
+```
+
+Open `http://127.0.0.1:5173/`.
+
+**7. Run a demo**
+
+Click **Start another run**, fill in the form, tick both approval boxes and start the workflow. When the recording panel appears, upload the recording from `demo_recordings/` and click **Replay recording on the current code**.
+
+| Demo | Repository path | Bug title | Bug description | Recording |
+|---|---|---|---|---|
+| Level 1 Todo | `<parent-folder>\target-projects\ai-bug-fixing-agent-demo` | `Whitespace-only input is added to the to-do list` | `Submitting the Add Task form with only spaces adds a blank item to the Added Task list.` | `demo_recordings\empty-task-recording.spec.ts` |
+| Level 2 MERN | `<parent-folder>\target-projects\mern-stack-example` | `Blank employee record can be saved` | `Submitting the Create Employee form with empty fields saves a blank record to the employee list.` | `demo_recordings\empty-employee-recording.spec.ts` |
+
+Use these exact titles: a title containing both "empty" and "task" (Level 1), or the title "employee creation accepts empty required fields" (Level 2), starts a built-in automatic reproduction instead, and the recording panel does not appear.
+
+A run takes about 5–15 minutes. The expected result is `PASS`, with the recording failing before the fix and passing after it. The recordings were made with `playwright codegen`; the expected-behaviour assertion at the end of each one was added by hand.
+
+**8. Before running the same demo again**
+
+A run leaves the AI fix and the generated test in the demo project. Reset it first:
+
+```powershell
+cd <parent-folder>\ai-agent-learning
+.\venv\Scripts\python.exe reset_demo_copy.py <parent-folder>\target-projects\ai-bug-fixing-agent-demo <parent-folder>\target-projects\mern-stack-example --yes
+```
+
+**If a run fails:** the final report says why. "AI limit" means the Groq daily or per-minute limit was reached, or Groq could not be reached; wait and start again. The Level 2 demo never touches your own MongoDB data.
+
 ---
 
 ## 11. Running the Complete Agentic Workflow
@@ -580,7 +674,7 @@ Create a `.env` file using `.env.example` as a reference and configure the requi
 From the project directory:
 
 ```powershell
-cd C:\Users\SINGER\OneDrive\Desktop\ai-agent-learning
+cd <project-folder>
 ```
 
 Run the complete workflow:
@@ -606,14 +700,14 @@ The same workflow can be driven from a local React console. It needs two termina
 Terminal 1, the local workflow API (listens only on `127.0.0.1:8765`):
 
 ```powershell
-cd C:\Users\SINGER\OneDrive\Desktop\ai-agent-learning
+cd <project-folder>
 .\venv\Scripts\python.exe workflow_ui_api.py
 ```
 
 Terminal 2, the console (Vite proxies `/api` to the workflow API):
 
 ```powershell
-cd C:\Users\SINGER\OneDrive\Desktop\ai-agent-learning\level3-serverless-app\frontend
+cd <project-folder>\level3-serverless-app\frontend
 npm run dev
 ```
 
